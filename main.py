@@ -378,6 +378,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Parsing Error", f"Gagal membaca file DXF: {str(e)}")
 
     def convert_dxf_to_gcode(self):
+        # Cek dari path file, bukan dari hasil shapes lama
         if not getattr(self, 'dxf_filepath', None):
             QMessageBox.warning(self, "Warning", "Buka file DXF terlebih dahulu!")
             return
@@ -389,10 +390,14 @@ class MainWindow(QMainWindow):
         try:
             parser = PCBFillDXFParser(config)
             self.current_parsed_shapes = parser.parse_dxf(self.dxf_filepath)
+ 
             self.dxf_canvas.plot_data(self.current_parsed_shapes, fill_color='red')
+ 
             gcode_str = parser.generate_hatching_gcode(self.current_parsed_shapes)
+ 
             self.gcode_editor.clear()
             self.gcode_editor.setText(gcode_str)
+ 
             QMessageBox.information(
                 self, "Success", 
                 "G-Code berhasil di-generate ulang dengan konfigurasi terbaru!"
