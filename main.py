@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog, 
     QTextEdit, QGroupBox, QSplitter, QMessageBox
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -19,132 +19,136 @@ from matplotlib.patches import Polygon as MplPolygon, Circle as MplCircle
 from matplotlib.figure import Figure
 
 try:
-    # Tambahkan LineString di import shapely
     from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon, LineString
     HAS_SHAPELY = True
 except ImportError:
     HAS_SHAPELY = False
 
 
-class PCBFillDXFParser:
-    def __init__(self, config):
+class DXFWorkerThread(QThread):
+    finished = pyqtSignal(list, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, dxf_filepath, config):
+        super().__init__()
+        self.dxf_filepath = dxf_filepath
         self.config = config
-        self.spot_size = config.get("spot_size_x", 0.06)
-        self.max_error = config.get("flattening_max_error", 0.001)
 
-    def parse_dxf(self, dxf_filepath):
-        """Membaca DXF, membongkar matriks BLOCK/INSERT, dan mem-parsing pad SOLID & ketebalan Track."""
-        doc = ezdxf.readfile(dxf_filepath)
-        
-        all_entities = list(doc.modelspace()) + list(doc.paperspace())
-        parsed_shapes = []
+    def run(self):
+        try:
+            spot_size = self.config.get("spot_size_x", 0.06)
+            max_error = self.config.get("flattening_max_error", 0.01)
 
-        # 1. Fungsi rekursif membongkar BLOCK tanpa merusak rotasi/skala
-        def get_all_base_entities(entities):
-            base = []
-            for ent in entities:
-                if ent.dxftype() == 'INSERT':
+            doc = ezdxf.readfile(self.dxf_filepath)
+            all_entities = list(doc.modelspace()) + list(doc.paperspace())
+            parsed_shapes = []
+
+            def get_all_base_entities(entities):
+                base = []
+                for ent in entities:
+                    if ent.dxftype() == 'INSERT':
+                        try:
+                            base.extend(get_all_base_entities(ent.virtual_entities()))
+                        except Exception:
+                            pass
+                    else:
+                        base.append(ent)
+                return base
+
+            entities_to_process = get_all_base_entities(all_entities)
+
+            for entity in entities_to_process:
+                dxftype = entity.dxftype()
+
+                if dxftype == 'CIRCLE':
+                    center = (entity.dxf.center.x, entity.dxf.center.y)
+                    radius = entity.dxf.radius
+                    parsed_shapes.append(('CIRCLE', (center, radius)))
+
+                elif dxftype in ('SOLID', 'TRACE'):
                     try:
-                        base.extend(get_all_base_entities(ent.virtual_entities()))
+                        pts = [
+                            (entity.dxf.vtx0.x, entity.dxf.vtx0.y),
+                            (entity.dxf.vtx1.x, entity.dxf.vtx1.y),
+                            (entity.dxf.vtx3.x, entity.dxf.vtx3.y),
+                            (entity.dxf.vtx2.x, entity.dxf.vtx2.y)
+                        ]
+                        parsed_shapes.append(('POLYGON', pts))
                     except Exception:
                         pass
-                else:
-                    base.append(ent)
-            return base
 
-        entities_to_process = get_all_base_entities(all_entities)
-
-        # 2. Proses geometri dasar yang sudah diekstrak
-        for entity in entities_to_process:
-            dxftype = entity.dxftype()
-
-            if dxftype == 'CIRCLE':
-                center = (entity.dxf.center.x, entity.dxf.center.y)
-                radius = entity.dxf.radius
-                parsed_shapes.append(('CIRCLE', (center, radius)))
-
-            elif dxftype in ('SOLID', 'TRACE'):
-                try:
-                    pts = [
-                        (entity.dxf.vtx0.x, entity.dxf.vtx0.y),
-                        (entity.dxf.vtx1.x, entity.dxf.vtx1.y),
-                        (entity.dxf.vtx3.x, entity.dxf.vtx3.y),
-                        (entity.dxf.vtx2.x, entity.dxf.vtx2.y)
-                    ]
-                    parsed_shapes.append(('POLYGON', pts))
-                except Exception:
-                    pass
-
-            elif dxftype in ('LWPOLYLINE', 'POLYLINE', 'LINE', 'ARC', 'ELLIPSE', 'SPLINE', 'HATCH'):
-                try:
-                    paths = []
-                    if hasattr(ezdxf_path, 'make_paths_from_entity'):
-                        paths = ezdxf_path.make_paths_from_entity(entity)
-                    else:
-                        paths = [ezdxf_path.make_path(entity)]
-                        
-                    # Ekstrak Ketebalan Garis (Track Width) jika ada
-                    line_width = 0
-                    if dxftype == 'LWPOLYLINE':
-                        if entity.dxf.hasattr('const_width') and entity.dxf.const_width > 0:
-                            line_width = entity.dxf.const_width
+                elif dxftype in ('LWPOLYLINE', 'POLYLINE', 'LINE', 'ARC', 'ELLIPSE', 'SPLINE', 'HATCH'):
+                    try:
+                        paths = []
+                        if hasattr(ezdxf_path, 'make_paths_from_entity'):
+                            paths = ezdxf_path.make_paths_from_entity(entity)
                         else:
-                            try:
-                                # Coba ekstrak ketebalan dari metadata vertex jika const_width tidak disetel
-                                if len(entity) > 0:
-                                    first_vtx = entity.lwpoints[0]
-                                    if len(first_vtx) >= 4:
-                                        line_width = max(first_vtx[2], first_vtx[3]) 
-                            except Exception:
-                                pass
-                                
-                    for p in paths:
-                        pts = [(pt.x, pt.y) for pt in p.flattening(distance=self.max_error)]
-                        if len(pts) < 2:
-                            continue
+                            paths = [ezdxf_path.make_path(entity)]
                             
-                        # Cek apakah ini bentuk loop tertutup
-                        is_closed = False
-                        if len(pts) >= 3:
-                            dist_start_end = math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1])
-                            if p.is_closed or dist_start_end < 0.001:
-                                is_closed = True
-                                
-                        # Konversi jalur ke poligon tebal jika memiliki parameter line_width
-                        if line_width > 0 and HAS_SHAPELY:
-                            if is_closed and pts[0] != pts[-1]:
-                                pts.append(pts[0])
-                            # Buffer otomatis membesarkan jalur dengan round caps layaknya PCB trace
-                            poly = LineString(pts).buffer(line_width / 2.0)
-                            if isinstance(poly, ShapelyPolygon):
-                                parsed_shapes.append(('POLYGON', list(poly.exterior.coords)))
-                            elif isinstance(poly, MultiPolygon):
-                                for sub_p in poly.geoms:
-                                    parsed_shapes.append(('POLYGON', list(sub_p.exterior.coords)))
-                        else:
-                            # Jika tak ada ketebalan (0), proses standar
-                            if is_closed:
-                                parsed_shapes.append(('POLYGON', pts))
+                        line_width = 0
+                        if dxftype == 'LWPOLYLINE':
+                            if entity.dxf.hasattr('const_width') and entity.dxf.const_width > 0:
+                                line_width = entity.dxf.const_width
                             else:
-                                parsed_shapes.append(('LINE', pts))
-                except Exception:
-                    pass
+                                try:
+                                    if len(entity) > 0:
+                                        first_vtx = entity.lwpoints[0]
+                                        if len(first_vtx) >= 4:
+                                            line_width = max(first_vtx[2], first_vtx[3]) 
+                                except Exception:
+                                    pass
+                                    
+                        for p in paths:
+                            pts = [(pt.x, pt.y) for pt in p.flattening(distance=max_error)]
+                            if len(pts) < 2:
+                                continue
+                                
+                            is_closed = False
+                            if len(pts) >= 3:
+                                dist_start_end = math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1])
+                                if p.is_closed or dist_start_end < 0.001:
+                                    is_closed = True
+                                    
+                            if line_width > 0 and HAS_SHAPELY:
+                                if is_closed and pts[0] != pts[-1]:
+                                    pts.append(pts[0])
+                                poly = LineString(pts).buffer(line_width / 2.0)
+                                if isinstance(poly, ShapelyPolygon):
+                                    parsed_shapes.append(('POLYGON', list(poly.exterior.coords)))
+                                elif isinstance(poly, MultiPolygon):
+                                    for sub_p in poly.geoms:
+                                        parsed_shapes.append(('POLYGON', list(sub_p.exterior.coords)))
+                            else:
+                                if is_closed:
+                                    parsed_shapes.append(('POLYGON', pts))
+                                else:
+                                    parsed_shapes.append(('LINE', pts))
+                    except Exception:
+                        pass
 
-        return parsed_shapes
+            # Mengoper parameter self.config ke fungsi generator
+            gcode_str = self.generate_hatching_gcode(parsed_shapes, self.config)
+            self.finished.emit(parsed_shapes, gcode_str)
 
-    def generate_hatching_gcode(self, parsed_shapes):
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def generate_hatching_gcode(self, parsed_shapes, config):
+        spot_size = config.get("spot_size_x", 0.06)
+        max_error = config.get("flattening_max_error", 0.01)
+
         gcode = []
         gcode.append("; --- Generated by Sculpfun PCB High-Precision Laser Parser ---")
-        gcode.append(f"; Precision: {self.max_error} mm | Spot Size: {self.spot_size} mm")
+        gcode.append(f"; Precision: {max_error} mm | Spot Size: {spot_size} mm")
         gcode.append("G21 ; Millimeters")
         gcode.append("G90 ; Absolute positioning")
         gcode.append("M5  ; Laser OFF")
-        gcode.append(f"G0 F{self.config['max_feedrate_g0']}")
+        gcode.append(f"G0 F{config['max_feedrate_g0']}")
         gcode.append("")
 
         passes = [
-            ("Pass 1: Ablation / Striping", self.config['laser_power_pass1']),
-            ("Pass 2: Clean Cut / Finishing", self.config['laser_power_pass2'])
+            ("Pass 1: Ablation / Striping", config['laser_power_pass1']),
+            ("Pass 2: Clean Cut / Finishing", config['laser_power_pass2'])
         ]
 
         toolpaths = []
@@ -160,7 +164,7 @@ class PCBFillDXFParser:
                         angle = 2 * math.pi * i / segments
                         pts.append((center[0] + curr_r * math.cos(angle), center[1] + curr_r * math.sin(angle)))
                     toolpaths.append(pts)
-                    curr_r -= self.spot_size
+                    curr_r -= spot_size
 
             elif shape_type == 'POLYGON':
                 pts = data
@@ -174,7 +178,7 @@ class PCBFillDXFParser:
                             elif isinstance(curr_poly, MultiPolygon):
                                 for sub_p in curr_poly.geoms:
                                     toolpaths.append(list(sub_p.exterior.coords))
-                            curr_poly = curr_poly.buffer(-self.spot_size)
+                            curr_poly = curr_poly.buffer(-spot_size)
                     except Exception:
                         toolpaths.append(pts)
                 else:
@@ -198,7 +202,7 @@ class PCBFillDXFParser:
                 gcode.append(f"M4 S{int(power)}")
                 
                 for pt in path[1:]:
-                    gcode.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} F{self.config['max_feedrate_g1']}")
+                    gcode.append(f"G1 X{pt[0]:.4f} Y{pt[1]:.4f} F{config['max_feedrate_g1']}")
                 
                 gcode.append("M5 ; Laser OFF")
                 gcode.append("")
@@ -242,11 +246,11 @@ class FastPlotCanvas(FigureCanvas):
                 lines.append(data)
 
         if patches:
-            pc = PatchCollection(patches, facecolors=fill_color, edgecolors=fill_color, alpha=0.9)
+            pc = PatchCollection(patches, facecolors=fill_color, edgecolors=fill_color, alpha=0.9, antialiased=False)
             self.axes.add_collection(pc)
 
         if lines:
-            lc = LineCollection(lines, colors=fill_color, linewidths=1.2, antialiased=True)
+            lc = LineCollection(lines, colors=fill_color, linewidths=1.2, antialiased=False)
             self.axes.add_collection(lc)
 
         self.axes.autoscale()
@@ -256,11 +260,12 @@ class FastPlotCanvas(FigureCanvas):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sculpfun C1 Mini - DXF to PCB Solid Laser G-Code")
+        self.setWindowTitle("Sculpfun C1 Mini - DXF to PCB Solid Laser G-Code (Optimized)")
         self.resize(1250, 850)
 
         self.current_parsed_shapes = []
         self.dxf_filepath = ""
+        self.worker = None
 
         self.init_ui()
 
@@ -280,7 +285,7 @@ class MainWindow(QMainWindow):
 
         self.inputs = {}
         default_config = [
-            ("Curve Precision Error (mm)", "flattening_max_error", "0.001"),
+            ("Curve Precision Error (mm)", "flattening_max_error", "0.01"),
             ("Spot Size X (mm)", "spot_size_x", "0.06"),
             ("Spot Size Y (mm)", "spot_size_y", "0.08"),
             ("Max G0 Feedrate (mm/min)", "max_feedrate_g0", "3000"),
@@ -360,26 +365,10 @@ class MainWindow(QMainWindow):
         filepath, _ = QFileDialog.getOpenFileName(self, "Buka File DXF", "", "DXF Files (*.dxf)")
         if filepath:
             self.dxf_filepath = filepath
-            try:
-                config = self.get_config_dict()
-                if not config:
-                    return
-                
-                parser = PCBFillDXFParser(config)
-                self.current_parsed_shapes = parser.parse_dxf(filepath)
-                
-                self.dxf_canvas.plot_data(self.current_parsed_shapes, fill_color='red')
-                
-                QMessageBox.information(
-                    self, "Success", 
-                    f"Berhasil membaca DXF!\nTotal Bentuk Terdeteksi: {len(self.current_parsed_shapes)}"
-                )
-            except Exception as e:
-                QMessageBox.critical(self, "Parsing Error", f"Gagal membaca file DXF: {str(e)}")
+            self.convert_dxf_to_gcode()
 
     def convert_dxf_to_gcode(self):
-        # Cek dari path file, bukan dari hasil shapes lama
-        if not getattr(self, 'dxf_filepath', None):
+        if not self.dxf_filepath:
             QMessageBox.warning(self, "Warning", "Buka file DXF terlebih dahulu!")
             return
 
@@ -387,24 +376,36 @@ class MainWindow(QMainWindow):
         if not config:
             return
 
-        try:
-            parser = PCBFillDXFParser(config)
-            self.current_parsed_shapes = parser.parse_dxf(self.dxf_filepath)
- 
-            self.dxf_canvas.plot_data(self.current_parsed_shapes, fill_color='red')
- 
-            gcode_str = parser.generate_hatching_gcode(self.current_parsed_shapes)
- 
-            self.gcode_editor.clear()
-            self.gcode_editor.setText(gcode_str)
- 
-            QMessageBox.information(
-                self, "Success", 
-                "G-Code berhasil di-generate ulang dengan konfigurasi terbaru!"
-            )
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Gagal memproses ulang DXF: {str(e)}")
+        self.btn_open.setEnabled(False)
+        self.btn_convert.setEnabled(False)
+        self.btn_convert.setText("Memproses...")
+
+        self.worker = DXFWorkerThread(self.dxf_filepath, config)
+        self.worker.finished.connect(self.on_processing_finished)
+        self.worker.error.connect(self.on_processing_error)
+        self.worker.start()
+
+    def on_processing_finished(self, parsed_shapes, gcode_str):
+        self.current_parsed_shapes = parsed_shapes
+        self.dxf_canvas.plot_data(self.current_parsed_shapes, fill_color='red')
+        
+        self.gcode_editor.clear()
+        self.gcode_editor.setText(gcode_str)
+
+        self.btn_open.setEnabled(True)
+        self.btn_convert.setEnabled(True)
+        self.btn_convert.setText("2. Convert G-Code")
+
+        QMessageBox.information(
+            self, "Success", 
+            f"Berhasil memproses DXF!\nTotal Bentuk Terdeteksi: {len(self.current_parsed_shapes)}"
+        )
+
+    def on_processing_error(self, err_msg):
+        self.btn_open.setEnabled(True)
+        self.btn_convert.setEnabled(True)
+        self.btn_convert.setText("2. Convert G-Code")
+        QMessageBox.critical(self, "Parsing Error", f"Gagal membaca file DXF: {err_msg}")
 
     def export_gcode(self):
         gcode_content = self.gcode_editor.toPlainText()
