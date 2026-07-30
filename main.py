@@ -29,12 +29,11 @@ from matplotlib.patches import Polygon as MplPolygon, Circle as MplCircle
 from matplotlib.figure import Figure
 
 try:
-    from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon, LineString
+    from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon, LineString, Point
     from shapely.ops import unary_union
     HAS_SHAPELY = True
 except ImportError:
     HAS_SHAPELY = False
-
 
 class ParserWorkerThread(QThread):
     finished = pyqtSignal(list, str)
@@ -93,7 +92,10 @@ class ParserWorkerThread(QThread):
                             shape_type, data = item
                             if shape_type == 'CIRCLE':
                                 center, radius = data
-                                circ = ShapelyPolygon(center).buffer(max(radius, 0.001), resolution=32)
+                                
+                                #circ = ShapelyPolygon(center).buffer(max(radius, 0.001), resolution=32)
+                                circ = Point(center).buffer(max(radius, 0.001), resolution=32)
+                                
                                 if circ.is_valid:
                                     shapely_polys.append(circ)
                             elif shape_type == 'POLYGON':
@@ -106,7 +108,10 @@ class ParserWorkerThread(QThread):
                             elif shape_type == 'LINE':
                                 if len(data) >= 2:
                                     line_obj = LineString(data)
-                                    line_buf = line_obj.buffer(0.02, cap_style=2, join_style=2)
+                                    
+                                    # line_buf = line_obj.buffer(0.02, cap_style=2, join_style=2)
+                                    line_buf = line_obj.buffer(1, cap_style=1, join_style=1)
+                                    
                                     if line_buf.is_valid and not line_buf.is_empty:
                                         shapely_polys.append(line_buf)
                         elif isinstance(item, ShapelyPolygon):
@@ -127,6 +132,18 @@ class ParserWorkerThread(QThread):
                             batch = shapely_polys[i:i+batch_size]
                             batch.append(merged_poly)
                             merged_poly = unary_union(batch)
+                            
+                        # --- TAMBAHKAN KODE HEALING INI ---
+                        try:
+                            # 1. Sedikit "puffin" (perbesaran mikro) dengan buffer 0.02 untuk melumerkan/menyatukan ujung segmen yang terputus
+                            # 2. Buffer positif luar 0.03 dengan mitre untuk merapikan sudut siku
+                            # 3. Susutkan kembali dengan total offset yang sesuai agar lebar jalur tetap presisi
+                            step1 = merged_poly.buffer(0.02, join_style=2)
+                            step2 = step1.buffer(0.03, join_style=2, mitre_limit=3.0)
+                            merged_poly = step2.buffer(-0.05, join_style=1)
+                        except Exception as e:
+                            print(f"Healing warning: {e}")
+                        # ----------------------------------
                         
                         def extract_coords(geom):
                             if isinstance(geom, ShapelyPolygon):
@@ -157,12 +174,16 @@ class ParserWorkerThread(QThread):
                     data = item[1] if isinstance(item, tuple) else None
 
                     if shape_type == 'POLYGON' and isinstance(item, tuple):
-                        if HAS_SHAPELY and len(data) >= 3:
+                        if HAS_SHAPELY and len(data) >= 3:                           
                             try:
                                 poly = ShapelyPolygon(data)
                                 if not poly.is_valid:
                                     poly = poly.buffer(0)
-                                offset_poly = poly.buffer(spot_size, cap_style=3, join_style=2)
+                                # offset_poly = poly.buffer(spot_size, cap_style=3, join_style=2)
+                                # join_style (gaya sudut) = 1. Round (tajam), 2. Mitre (lancip), 3. Bevel (tajam dipotong diagonal).
+                                # cap_style (gaya ujung) = 1. Round (setengah lingkaran), 2. Flat (rata persis), 3. Square (dipotong rata).
+                                # spot_size = jarak offset sudut laser dari polygonnya.
+                                offset_poly = poly.buffer(spot_size / 3.0, cap_style=1, join_style=1)
                                 
                                 if isinstance(offset_poly, ShapelyPolygon) and not offset_poly.is_empty:
                                     parsed_shapes.append(('POLYGON', list(offset_poly.exterior.coords)))
@@ -547,7 +568,8 @@ class FastPlotCanvas(FigureCanvas):
                 lines.append(data)
 
         if patches:
-            pc = PatchCollection(patches, facecolors=fill_color, edgecolors=fill_color, alpha=0.9, antialiased=False)
+            # pc = PatchCollection(patches, facecolors=fill_color, edgecolors=fill_color, alpha=0.9, antialiased=False)
+            pc = PatchCollection(patches, facecolors=fill_color, edgecolors='none', linewidth=0, alpha=0.9, antialiased=False)
             self.axes.add_collection(pc)
 
         if lines:
