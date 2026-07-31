@@ -3,14 +3,14 @@
 A comprehensive Python-based desktop suite for processing, healing, simulating, and auditing G-Code and CAD files (DXF, SVG, PNG, G-Code). Designed specifically for CNC routers, laser engravers, and GRBL-based controllers.
 
 ## **📁 Repository Structure**
-
+~~~ bash
 ├── LICENSE              \# License information  
 ├── README.md            \# Project documentation  
 ├── auditor.py           \# G-Code auditor & path distance / area calculator  
 ├── main.py              \# Main DXF/SVG/PNG processor & G-Code generator (Healing Corner included)  
 ├── requirements.txt     \# Python dependency list  
 └── simulator.py         \# Real-time interactive G-Code execution simulator
-
+~~~
 ## **🚀 Overview of Tools & Components**
 
 ### **1\. main.py — Vector Processing & G-Code Generator**
@@ -49,29 +49,29 @@ A lightweight, interactive G-Code previewer built on Python's turtle graphics en
 > * **Python:** 3.8 or higher recommended.
 
 ### **1\. Clone the Repository**
-
+~~~ bash
 git clone https://github.com/your-username/your-repo-name.git  
 cd your-repo-name
-
+~~~
 ### **2\. Install Dependencies**
-
+~~~ bash
 Install all required libraries using requirements.txt:  
 pip install \-r requirements.txt
-
+~~~
 ## **📖 Usage Guide**
 
 ### **Running the Main CAD Generator & Healer**
-
+~~~ bash
 python main.py
-
+~~~
 ### **Auditing a G-Code File**
-
+~~~ bash
 python auditor.py
-
+~~~
 ### **Simulating Machine Execution**
-
+~~~ bash
 python simulator.py
-
+~~~
 ## **⚙️ Supported G-Code & GRBL Parameters**
 
 | Parameter / Code | Description |
