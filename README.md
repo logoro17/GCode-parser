@@ -55,8 +55,8 @@ cd your-repo-name
 ~~~
 ### **2\. Install Dependencies**
 ~~~ bash
-Install all required libraries using requirements.txt:  
-pip install \-r requirements.txt
+# Install all required libraries using requirements.txt:  
+pip install -r requirements.txt
 ~~~
 ## **📖 Usage Guide**
 
