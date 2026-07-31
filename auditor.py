@@ -9,7 +9,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 class GCodeAuditorUltimate:
     def __init__(self, root):
         self.root = root
-        self.root.title("G-Code Auditor: Ultimate Distance & Area Calculator")
+        self.root.title("G-Code Auditor: Ultimate Distance & Area Calculator (GRBL Compatible)")
         self.root.geometry("1300x800")
 
         # --- HEADER ---
@@ -60,12 +60,13 @@ class GCodeAuditorUltimate:
         with open(path, 'r') as f: lines = f.readlines()
         self.process_gcode(lines, path.split('/')[-1])
 
-    # --- MATH FUNCTIONS ---
+    # --- MATH & PARSING FUNCTIONS ---
     def get_params(self, line):
+        """Ekstraksi seluruh parameter G, M, X, Y, Z, I, J, F, S dari baris G-Code"""
         params = {}
-        for char in ['X', 'Y', 'I', 'J']:
-            match = re.search(f'{char}([-+]?[0-9]*\.?[0-9]+)', line)
-            if match: params[char] = float(match.group(1))
+        matches = re.findall(r'([GMXYZIJSF])\s*([-+]?[0-9]*\.?[0-9]+)', line)
+        for char, val in matches:
+            params[char] = float(val)
         return params
 
     def calculate_polygon_area(self, points):
@@ -78,9 +79,10 @@ class GCodeAuditorUltimate:
             area -= points[j][0] * points[i][1]
         return abs(area) / 2.0
 
-    def generate_arc_points(self, start, end, center_offset, is_ccw):
+    def generate_arc_points(self, start, end, center_offset, is_ccw, scale=1.0):
         sx, sy = start; ex, ey = end
-        ix, iy = center_offset.get('I', 0), center_offset.get('J', 0)
+        ix = center_offset.get('I', 0) * scale
+        iy = center_offset.get('J', 0) * scale
         cx = sx + ix; cy = sy + iy
         radius = math.sqrt(ix**2 + iy**2)
         start_angle = math.atan2(sy - cy, sx - cx)
@@ -112,15 +114,20 @@ class GCodeAuditorUltimate:
         self.terminal.insert(tk.END, f"FILE: {filename}\n", "header")
         self.terminal.insert(tk.END, "-"*50 + "\n", "header")
 
-        cx, cy = 0, 0
-        spindle_on = False
+        # --- STATE MESIN GRBL ---
+        cx, cy, cz = 0.0, 0.0, 0.0
+        unit_scale = 1.0       # G21 = 1.0 (mm), G20 = 25.4 (inch)
+        is_relative = False    # G90 = Absolute, G91 = Relative
+        laser_spindle_on = False # Aktif jika M3/M4
+        active_g_mode = 0      # Modal command: 0 = G0 (Rapid), 1 = G1 (Linear), 2 = G2, 3 = G3
+        feedrate = 1000.0
+        spindle_power = 0.0
         
         object_counter = 0
         
-        # --- TOTAL ACCUMULATORS (METRIK UTAMA) ---
+        # --- TOTAL ACCUMULATORS ---
         total_rapid_dist = 0.0   # Jarak G0 (Merah)
         total_cut_dist = 0.0     # Jarak G1/G2/G3 (Hitam)
-        # Note: Total Keseluruhan = total_rapid_dist + total_cut_dist
         
         # Buffers
         current_poly_points = []
@@ -136,42 +143,65 @@ class GCodeAuditorUltimate:
             clean_line = line.split('(')[0].split(';')[0].strip().upper()
             if not clean_line: continue
             
-            # 1. Update Spindle
-            if 'M03' in clean_line or 'M3' in clean_line: spindle_on = True
-            elif 'M05' in clean_line or 'M5' in clean_line: spindle_on = False
-            
-            # 2. Parse Params
             params = self.get_params(clean_line)
-            nx, ny = params.get('X'), params.get('Y')
+            if not params: continue
+
+            # 1. BACA / UPDATE SETTING MESIN & PARAMETER
+            if 'G' in params:
+                g_val = int(params['G'])
+                if g_val == 20: unit_scale = 25.4
+                elif g_val == 21: unit_scale = 1.0
+                elif g_val == 90: is_relative = False
+                elif g_val == 91: is_relative = True
+                elif g_val in (0, 1, 2, 3): active_g_mode = g_val
+
+            if 'M' in params:
+                m_val = int(params['M'])
+                if m_val in (3, 4): laser_spindle_on = True # M3 / M4 Dynamic Laser Mode
+                elif m_val == 5: laser_spindle_on = False
+
+            if 'F' in params: feedrate = params['F']
+            if 'S' in params: spindle_power = params['S']
+            if 'Z' in params: cz = params['Z'] * unit_scale
+
+            # 2. KALKULASI KOORDINAT TARGET
+            has_xy_motion = ('X' in params or 'Y' in params)
             
-            if nx is None and ny is None: continue
-            
-            tx = nx if nx is not None else cx
-            ty = ny if ny is not None else cy
-            
-            # HITUNG JARAK LANGKAH INI (STEP DISTANCE)
+            if has_xy_motion:
+                if 'X' in params:
+                    val_x = params['X'] * unit_scale
+                    tx = (cx + val_x) if is_relative else val_x
+                else:
+                    tx = cx
+
+                if 'Y' in params:
+                    val_y = params['Y'] * unit_scale
+                    ty = (cy + val_y) if is_relative else val_y
+                else:
+                    ty = cy
+            else:
+                # Tidak ada pergerakan X/Y pada baris ini
+                continue
+
+            # Hitung jarak pergerakan saat ini
             step_dist = math.sqrt((tx - cx)**2 + (ty - cy)**2)
+
+            # 3. KLASIFIKASI MODE (CUTTING VS TRAVEL)
+            # Cutting jika Mode G1/G2/G3 DAN (Laser/Spindle Aktif atau Z <= 0)
+            is_cut_code = (active_g_mode in (1, 2, 3))
+            is_cutting_active = is_cut_code and (laser_spindle_on or cz <= 0)
             
-            # 3. KLASIFIKASI MODE
-            is_g1 = re.search(r'G0?1(\D|$)', clean_line)
-            is_g2 = re.search(r'G0?2(\D|$)', clean_line)
-            is_g3 = re.search(r'G0?3(\D|$)', clean_line)
-            is_cut_code = is_g1 or is_g2 or is_g3
-            
-            mode = "TRAVEL"
-            if is_cut_code and spindle_on:
-                mode = "CUTTING"
+            mode = "CUTTING" if is_cutting_active else "TRAVEL"
             
             # --- AKUMULASI TOTAL JARAK ---
             if mode == "CUTTING":
-                total_cut_dist += step_dist # Tambah ke Total Cutting
+                total_cut_dist += step_dist
             else:
-                total_rapid_dist += step_dist # Tambah ke Total Rapid
+                total_rapid_dist += step_dist
             
-            # --- LOGIKA AREA & SEGMENT ---
-
+            # --- LOGIKA AREA & SEGMENTATION ---
             if mode == "CUTTING":
-                # Tutup buku Travel jika sebelumnya Travel
+                # Tutup log Travel jika sebelumnya sedang Travel
                 if is_traveling:
                     msg = (f"[TRAVEL] Dist: {travel_accumulated_dist:.2f} mm\n"
                            f"   From: ({travel_start_pos[0]:.1f}, {travel_start_pos[1]:.1f}) -> To: ({cx:.1f}, {cy:.1f})\n")
@@ -179,27 +209,29 @@ class GCodeAuditorUltimate:
                     is_traveling = False
                     travel_accumulated_dist = 0.0
                 
-                # Area Buffer
+                # Inisialisasi Buffer Area Baru
                 if not is_collecting_area:
                     is_collecting_area = True
                     current_poly_points = [(cx, cy)]
                     current_block_xs = [cx]; current_block_ys = [cy]
                 
                 points_to_add = []
-                if is_g1: points_to_add = [(tx, ty)]
-                elif is_g2 or is_g3: points_to_add = self.generate_arc_points((cx, cy), (tx, ty), params, is_ccw=bool(is_g3))
+                if active_g_mode == 1:
+                    points_to_add = [(tx, ty)]
+                elif active_g_mode in (2, 3):
+                    points_to_add = self.generate_arc_points((cx, cy), (tx, ty), params, is_ccw=(active_g_mode == 3), scale=unit_scale)
                 
                 current_poly_points.extend(points_to_add)
                 for px, py in points_to_add:
                     current_block_xs.append(px); current_block_ys.append(py)
 
             elif mode == "TRAVEL":
-                # Tutup buku Cutting (Hitung Luas)
+                # Tutup log Cutting dan Hitung Luas Area Objek
                 if is_collecting_area:
                     object_counter += 1
                     area = self.calculate_polygon_area(current_poly_points)
                     
-                    # Gambar Bounding Box
+                    # Bounding Box
                     if current_block_xs:
                         min_x = min(current_block_xs); max_x = max(current_block_xs)
                         min_y = min(current_block_ys); max_y = max(current_block_ys)
@@ -230,7 +262,7 @@ class GCodeAuditorUltimate:
             
             cx, cy = tx, ty
 
-        # Handle EOF
+        # Handle End-Of-File (EOF)
         if is_collecting_area and len(current_poly_points) > 2:
             object_counter += 1
             area = self.calculate_polygon_area(current_poly_points)
@@ -243,10 +275,10 @@ class GCodeAuditorUltimate:
             self.terminal.insert(tk.END, msg, "cut")
 
         if is_traveling and travel_accumulated_dist > 0:
-            msg = (f"[TRAVEL] Dist: {travel_accumulated_dist:.2f} mm (EOF)\n")
+            msg = f"[TRAVEL] Dist: {travel_accumulated_dist:.2f} mm (EOF)\n"
             self.terminal.insert(tk.END, msg, "travel")
 
-        # --- GRAND TOTAL SUMMARY ---
+        # --- SUMMARY FINAL ---
         grand_total = total_rapid_dist + total_cut_dist
         
         summary_text = (
@@ -263,10 +295,10 @@ class GCodeAuditorUltimate:
         self.terminal.insert(tk.END, "="*45 + "\n", "header")
         self.terminal.see(tk.END)
         
-        # Update Header Info
+        # Header Info
         self.lbl_info.config(text=f"Total Dist: {grand_total:.2f} mm (Rapid: {total_rapid_dist:.1f} + Cut: {total_cut_dist:.1f})")
 
-        # Legend
+        # Legend Plotting
         from matplotlib.lines import Line2D
         legend_elements = [
             Line2D([0],[0], color='black', lw=1.5, label='Cutting'),
