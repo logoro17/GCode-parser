@@ -5,6 +5,7 @@ import ezdxf
 from ezdxf import path as ezdxf_path
 import cv2
 import numpy as np
+import xml.etree.ElementTree as ET
 
 try:
     from svgelements import SVG, Path as SVGPath
@@ -16,7 +17,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog, 
     QTextEdit, QGroupBox, QSplitter, QMessageBox, QComboBox,
-    QDialog, QCheckBox, QScrollArea, QDialogButtonBox, QAbstractItemView
+    QDialog, QCheckBox, QScrollArea, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -35,23 +36,146 @@ try:
 except ImportError:
     HAS_SHAPELY = False
 
+
+def scan_dxf_layers(filepath):
+    doc = ezdxf.readfile(filepath)
+    msp = doc.modelspace()
+    counts = Counter()
+
+    def _count(entity):
+        layer_name = getattr(entity.dxf, 'layer', '0') or '0'
+        counts[layer_name] += 1
+
+    for entity in msp:
+        if entity.dxftype() == 'INSERT':
+            try:
+                for virt_ent in entity.virtual_entities():
+                    _count(virt_ent)
+            except Exception:
+                pass
+        else:
+            _count(entity)
+
+    if not counts:
+        for entity in doc.paperspace():
+            _count(entity)
+
+    return counts
+
+def scan_brd_layers(filepath):
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+    counts = Counter()
+    layer_map = {}
+    object_counts = Counter()
+
+    for layer_def in root.iter('layer'):
+        num = layer_def.get('number')
+        name = layer_def.get('name')
+        if num and name: layer_map[num] = name
+
+    for elem in root.iter():
+        # Deteksi Objek
+        if elem.tag in ['wire', 'pad', 'via', 'smd', 'polygon', 'circle', 'text']:
+            object_counts[elem.tag] += 1
+
+        # Pemetaan Layer
+        if 'layer' in elem.attrib:
+            num = elem.attrib['layer']
+            name = layer_map.get(num, f"Layer_{num}")
+            counts[name] += 1
+            if elem.tag == 'smd':
+                if num == '1': 
+                    counts[layer_map.get('29', 'tStop')] += 1
+                    counts[layer_map.get('31', 'tCream')] += 1
+                elif num == '16':
+                    counts[layer_map.get('30', 'bStop')] += 1
+                    counts[layer_map.get('32', 'bCream')] += 1
+        elif elem.tag in ['pad', 'via']:
+            for l_implicit in ['17', '18', '1', '16', '29', '30']:
+                counts[layer_map.get(l_implicit, f"Layer_{l_implicit}")] += 1
+
+    return {k: v for k, v in counts.items() if v > 0}, layer_map, object_counts
+
+
+_LAYER_DEFAULT_EXCLUDE_KEYWORDS = (
+    'paste', 'hole', 'drill', 'silk', 'dimension', 'comment',
+    'keepout', 'assembly', 'courtyard', 'doc', 'note', 'bplace', 'tplace',
+    'bnames', 'tnames', 'bvalues', 'tvalues', 'document'
+)
+
+
+class LayerSelectionDialog(QDialog):
+    def __init__(self, layer_counts, object_counts=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pilih Layer & Objek")
+        self.resize(450, 550)
+
+        layout = QVBoxLayout(self)
+        splitter = QSplitter(Qt.Vertical)
+
+        # --- Panel Layer ---
+        layer_box = QGroupBox("Layers")
+        layer_layout = QVBoxLayout(layer_box)
+        scroll_layer = QScrollArea()
+        scroll_layer.setWidgetResizable(True)
+        w_layer = QWidget()
+        l_layer = QVBoxLayout(w_layer)
+        
+        self.layer_cbs = {}
+        for lname in sorted(layer_counts.keys()):
+            cb = QCheckBox(f"{lname} ({layer_counts[lname]})")
+            cb.setChecked(not any(kw in lname.lower() for kw in _LAYER_DEFAULT_EXCLUDE_KEYWORDS))
+            l_layer.addWidget(cb)
+            self.layer_cbs[lname] = cb
+            
+        l_layer.addStretch(1)
+        scroll_layer.setWidget(w_layer)
+        layer_layout.addWidget(scroll_layer)
+        splitter.addWidget(layer_box)
+
+        # --- Panel Object ---
+        self.obj_cbs = {}
+        if object_counts:
+            obj_box = QGroupBox("Objects")
+            obj_layout = QVBoxLayout(obj_box)
+            for obj_name in sorted(object_counts.keys()):
+                cb = QCheckBox(f"{obj_name.capitalize()} ({object_counts[obj_name]})")
+                cb.setChecked(obj_name != 'text') # Default: text tidak diproses
+                obj_layout.addWidget(cb)
+                self.obj_cbs[obj_name] = cb
+            splitter.addWidget(obj_box)
+
+        layout.addWidget(splitter)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_included_layers(self):
+        inc = [n for n, cb in self.layer_cbs.items() if cb.isChecked()]
+        return inc if len(inc) < len(self.layer_cbs) else None
+
+    def get_included_objects(self):
+        if not self.obj_cbs: return None
+        inc = [n for n, cb in self.obj_cbs.items() if cb.isChecked()]
+        return inc if len(inc) < len(self.obj_cbs) else None
+
 class ParserWorkerThread(QThread):
-    finished = pyqtSignal(list, str)
+    finished = pyqtSignal(list, str, list)
     error = pyqtSignal(str)
 
     def __init__(self, filepath, config):
         super().__init__()
         self.filepath = filepath
         self.config = config
-        # Diagnostics populated during parsing so the UI can show the user
-        # exactly what was read from the file (per-layer counts, excluded
-        # layers, entities that failed to parse, etc.)
         self.diagnostics = {
-            "layers_seen": Counter(),      # layer_name -> raw entity count encountered
-            "layers_included": Counter(),  # layer_name -> entities actually used
-            "layers_excluded": Counter(),  # layer_name -> entities skipped by filter
-            "parse_errors": 0,             # entities that raised and were skipped
-            "outline_source": None,        # how the outline was determined
+            "layers_seen": Counter(),
+            "layers_included": Counter(),
+            "layers_excluded": Counter(),
+            "parse_errors": 0,
+            "outline_source": None,
         }
 
     def run(self):
@@ -63,9 +187,11 @@ class ParserWorkerThread(QThread):
             raw_geometries = []
             ext = self.filepath.lower().split('.')[-1]
 
-            # 1. Routing Parsing Berdasarkan Ekstensi File
+            # 1. Fase Pembacaan Murni (Viewer Mode)
             if ext == 'dxf':
                 self._parse_dxf(raw_geometries, max_error)
+            elif ext == 'brd':
+                self._parse_brd(raw_geometries)
             elif ext in ['png', 'jpg', 'jpeg']:
                 self._parse_raster(raw_geometries) 
             elif ext == 'svg':
@@ -81,21 +207,17 @@ class ParserWorkerThread(QThread):
                 self.error.emit("Tidak ada entitas geometri yang berhasil diekstrak!")
                 return
 
-            # 2. Membersihkan dan Menggabungkan Geometri (Unary Union)
+            # 2. Fase Adding The Rule (Hanya jalan jika DRL dicentang)
             cleaned_geometries = []
-            if HAS_SHAPELY:
+            if HAS_SHAPELY and self.config.get("use_drl_rules", False):
                 try:
                     shapely_polys = []
-                    # Handle struktur data campuran (tuple atau objek langsung)
                     for item in raw_geometries:
                         if isinstance(item, tuple):
                             shape_type, data = item
                             if shape_type == 'CIRCLE':
                                 center, radius = data
-                                
-                                #circ = ShapelyPolygon(center).buffer(max(radius, 0.001), resolution=32)
                                 circ = Point(center).buffer(max(radius, 0.001), resolution=32)
-                                
                                 if circ.is_valid:
                                     shapely_polys.append(circ)
                             elif shape_type == 'POLYGON':
@@ -108,10 +230,7 @@ class ParserWorkerThread(QThread):
                             elif shape_type == 'LINE':
                                 if len(data) >= 2:
                                     line_obj = LineString(data)
-                                    
-                                    # line_buf = line_obj.buffer(0.02, cap_style=2, join_style=2)
                                     line_buf = line_obj.buffer(1, cap_style=1, join_style=1)
-                                    
                                     if line_buf.is_valid and not line_buf.is_empty:
                                         shapely_polys.append(line_buf)
                         elif isinstance(item, ShapelyPolygon):
@@ -125,7 +244,6 @@ class ParserWorkerThread(QThread):
                                 shapely_polys.append(line_buf)
 
                     if shapely_polys:
-                        # Batch processing (chunking) untuk mencegah freeze
                         batch_size = 250
                         merged_poly = shapely_polys[0]
                         for i in range(1, len(shapely_polys), batch_size):
@@ -133,17 +251,12 @@ class ParserWorkerThread(QThread):
                             batch.append(merged_poly)
                             merged_poly = unary_union(batch)
                             
-                        # --- TAMBAHKAN KODE HEALING INI ---
                         try:
-                            # 1. Sedikit "puffin" (perbesaran mikro) dengan buffer 0.02 untuk melumerkan/menyatukan ujung segmen yang terputus
-                            # 2. Buffer positif luar 0.03 dengan mitre untuk merapikan sudut siku
-                            # 3. Susutkan kembali dengan total offset yang sesuai agar lebar jalur tetap presisi
                             step1 = merged_poly.buffer(0.02, join_style=2)
                             step2 = step1.buffer(0.03, join_style=2, mitre_limit=3.0)
                             merged_poly = step2.buffer(-0.05, join_style=1)
                         except Exception as e:
                             print(f"Healing warning: {e}")
-                        # ----------------------------------
                         
                         def extract_coords(geom):
                             if isinstance(geom, ShapelyPolygon):
@@ -166,9 +279,10 @@ class ParserWorkerThread(QThread):
             if not cleaned_geometries:
                 cleaned_geometries = raw_geometries
 
-            # 3. Penerapan Mode Laser
+            # 3. Fase G-Code Parsing
             parsed_shapes = []
-            if laser_mode == 0:  # Isolation Routing
+            
+            if laser_mode == 0:  
                 for item in cleaned_geometries:
                     shape_type = item[0] if isinstance(item, tuple) else type(item).__name__
                     data = item[1] if isinstance(item, tuple) else None
@@ -177,13 +291,8 @@ class ParserWorkerThread(QThread):
                         if HAS_SHAPELY and len(data) >= 3:                           
                             try:
                                 poly = ShapelyPolygon(data)
-                                if not poly.is_valid:
-                                    poly = poly.buffer(0)
-                                # offset_poly = poly.buffer(spot_size, cap_style=3, join_style=2)
-                                # join_style (gaya sudut) = 1. Round (tajam), 2. Mitre (lancip), 3. Bevel (tajam dipotong diagonal).
-                                # cap_style (gaya ujung) = 1. Round (setengah lingkaran), 2. Flat (rata persis), 3. Square (dipotong rata).
-                                # spot_size = jarak offset sudut laser dari polygonnya.
-                                offset_poly = poly.buffer(spot_size / 3.0, cap_style=1, join_style=1)
+                                if not poly.is_valid: poly = poly.buffer(0)
+                                offset_poly = poly.buffer(spot_size / 2.0, cap_style=1, join_style=1)
                                 
                                 if isinstance(offset_poly, ShapelyPolygon) and not offset_poly.is_empty:
                                     parsed_shapes.append(('POLYGON', list(offset_poly.exterior.coords)))
@@ -203,52 +312,231 @@ class ParserWorkerThread(QThread):
                             parsed_shapes.append(('POLYGON', data))
                     else:
                         parsed_shapes.append(item if isinstance(item, tuple) else ('POLYGON', list(item.exterior.coords)))
-            else:
+            
+            elif laser_mode == 1:
                 parsed_shapes = cleaned_geometries
+                
+            elif laser_mode == 2:
+                if HAS_SHAPELY and cleaned_geometries:
+                    try:
+                        shapely_copper = []
+                        for item in cleaned_geometries:
+                            shape_type = item[0] if isinstance(item, tuple) else type(item).__name__
+                            data = item[1] if isinstance(item, tuple) else None
+                            if shape_type == 'POLYGON' and len(data) >= 3:
+                                poly = ShapelyPolygon(data)
+                                if not poly.is_valid: poly = poly.buffer(0)
+                                if poly.is_valid: shapely_copper.append(poly)
+                            elif shape_type == 'CIRCLE':
+                                center, radius = data
+                                poly = Point(center).buffer(max(radius, 0.001), resolution=32)
+                                if poly.is_valid: shapely_copper.append(poly)
+                                
+                        if shapely_copper:
+                            unified_copper = unary_union(shapely_copper)
+                            minx, miny, maxx, maxy = unified_copper.bounds
+                            
+                            margin = 2.0  
+                            bbox_poly = ShapelyPolygon([
+                                (minx - margin, miny - margin),
+                                (maxx + margin, miny - margin),
+                                (maxx + margin, maxy + margin),
+                                (minx - margin, maxy + margin)
+                            ])
+                            
+                            negative_area = bbox_poly.difference(unified_copper)
+                            
+                            def extract_coords(geom):
+                                if isinstance(geom, ShapelyPolygon) and not geom.is_empty:
+                                    parsed_shapes.append(('POLYGON', list(geom.exterior.coords)))
+                                    for interior in geom.interiors:
+                                        parsed_shapes.append(('POLYGON', list(interior.coords)))
+                                elif isinstance(geom, MultiPolygon):
+                                    for p in geom.geoms:
+                                        if not p.is_empty:
+                                            parsed_shapes.append(('POLYGON', list(p.exterior.coords)))
+                                            for interior in p.interiors:
+                                                parsed_shapes.append(('POLYGON', list(interior.coords)))
+                            
+                            extract_coords(negative_area)
+                        else:
+                            parsed_shapes = cleaned_geometries
+                    except Exception as e:
+                        print(f"Error pada Negative Clearance: {e}")
+                        parsed_shapes = cleaned_geometries
+                else:
+                    parsed_shapes = cleaned_geometries
 
             if not parsed_shapes:
                 parsed_shapes = raw_geometries
 
-            gcode_str = self.generate_hatching_gcode(parsed_shapes, self.config, laser_mode)
-            self.finished.emit(parsed_shapes, gcode_str)
+            gcode_str, toolpaths = self.generate_hatching_gcode(parsed_shapes, self.config, laser_mode)
+            self.finished.emit(parsed_shapes, gcode_str, toolpaths)
 
         except Exception as e:
             self.error.emit(str(e))
+
+    def _parse_brd(self, raw_geometries):
+        tree = ET.parse(self.filepath)
+        root = tree.getroot()
+        diag = self.diagnostics
+        included_layers = self.config.get("included_layers")
+        
+        layer_map = {}
+        for layer_def in root.iter('layer'):
+            num = layer_def.get('number')
+            name = layer_def.get('name')
+            if num and name: layer_map[num] = name
+
+        def is_item_valid(item):
+            included_objects = self.config.get("included_objects")
+            if included_objects is not None and item.tag not in included_objects:
+                return False
+            
+            l_num = item.get('layer')
+            valid = False
+            
+            if l_num:
+                lname = layer_map.get(str(l_num), f"Layer_{l_num}")
+                diag["layers_seen"][lname] += 1
+                
+                if included_layers is None or lname in included_layers:
+                    valid = True
+                
+                # Logika ekstraksi SMD untuk Solder Mask & Paste Mask
+                if item.tag == 'smd' and included_layers is not None:
+                    tstop = layer_map.get('29', 'tStop')
+                    tcream = layer_map.get('31', 'tCream')
+                    bstop = layer_map.get('30', 'bStop')
+                    bcream = layer_map.get('32', 'bCream')
+                    
+                    if l_num == '1' and (tstop in included_layers or tcream in included_layers): 
+                        valid = True
+                    elif l_num == '16' and (bstop in included_layers or bcream in included_layers): 
+                        valid = True
+
+                if included_layers is not None:
+                    if valid: 
+                        diag["layers_included"][lname] += 1
+                    else: 
+                        diag["layers_excluded"][lname] += 1
+                    
+            else:
+                # Logika tembus layer untuk Pad dan Via
+                if item.tag in ['pad', 'via']:
+                    if included_layers is None:
+                        valid = True
+                    else:
+                        implicit = [
+                            layer_map.get('17', 'Pads'), layer_map.get('18', 'Vias'),
+                            layer_map.get('1', 'Top'), layer_map.get('16', 'Bottom'),
+                            layer_map.get('29', 'tStop'), layer_map.get('30', 'bStop')
+                        ]
+                        if any(l in included_layers for l in implicit):
+                            valid = True
+            return valid
+
+        packages = {}
+        for lib in root.iter('library'):
+            lib_name = lib.get('name')
+            for pkg in lib.iter('package'):
+                packages[f"{lib_name}_{pkg.get('name')}"] = pkg
+
+        def parse_rot(r_str):
+            if not r_str: return 0.0, False
+            r_str = r_str.upper()
+            mirror = r_str.startswith('M')
+            if mirror: r_str = r_str[1:]
+            angle = float(r_str[1:]) if r_str.startswith('R') else 0.0
+            return angle, mirror
+
+        def transform(x, y, dx, dy, angle_deg, mirror):
+            a = math.radians(angle_deg)
+            if mirror: x = -x
+            nx = x * math.cos(a) - y * math.sin(a)
+            ny = x * math.sin(a) + y * math.cos(a)
+            return nx + dx, ny + dy
+
+        for elem in root.iter('element'):
+            pkg = packages.get(f"{elem.get('library')}_{elem.get('package')}")
+            if pkg is None: continue
+            
+            ex, ey = float(elem.get('x', 0)), float(elem.get('y', 0))
+            erot, emirror = parse_rot(elem.get('rot'))
+            
+            for item in pkg:
+                if not is_item_valid(item): continue
+                
+                if item.tag in ['pad', 'smd']:
+                    px, py = float(item.get('x', 0)), float(item.get('y', 0))
+                    tx, ty = transform(px, py, ex, ey, erot, emirror)
+                    
+                    if item.tag == 'smd':
+                        dx, dy = float(item.get('dx', 0)) / 2.0, float(item.get('dy', 0)) / 2.0
+                        c1, c2 = transform(-dx, -dy, 0, 0, erot, emirror), transform(dx, -dy, 0, 0, erot, emirror)
+                        c3, c4 = transform(dx, dy, 0, 0, erot, emirror), transform(-dx, dy, 0, 0, erot, emirror)
+                        raw_geometries.append(('POLYGON', [(tx+c1[0], ty+c1[1]), (tx+c2[0], ty+c2[1]), (tx+c3[0], ty+c3[1]), (tx+c4[0], ty+c4[1])]))
+                    else:
+                        drill = float(item.get('drill', 0.8))
+                        diameter = float(item.get('diameter', drill * 1.6))
+                        raw_geometries.append(('CIRCLE', ((tx, ty), diameter / 2.0)))
+                        
+                elif item.tag == 'wire':
+                    x1, y1 = float(item.get('x1', 0)), float(item.get('y1', 0))
+                    x2, y2 = float(item.get('x2', 0)), float(item.get('y2', 0))
+                    tx1, ty1 = transform(x1, y1, ex, ey, erot, emirror)
+                    tx2, ty2 = transform(x2, y2, ex, ey, erot, emirror)
+                    width = float(item.get('width', 0))
+                    
+                    if width > 0 and HAS_SHAPELY:
+                        line = LineString([(tx1, ty1), (tx2, ty2)])
+                        poly = line.buffer(width / 2.0, cap_style=1, join_style=1)
+                        if poly.is_valid and not poly.is_empty:
+                            raw_geometries.append(('POLYGON', list(poly.exterior.coords)))
+                    else:
+                        raw_geometries.append(('LINE', [(tx1, ty1), (tx2, ty2)]))
+
+        for section in ['plain', 'signals']:
+            for sec_node in root.iter(section):
+                for item in sec_node.iter():
+                    if not is_item_valid(item): continue
+                    
+                    if item.tag == 'wire':
+                        x1, y1 = float(item.get('x1', 0)), float(item.get('y1', 0))
+                        x2, y2 = float(item.get('x2', 0)), float(item.get('y2', 0))
+                        width = float(item.get('width', 0))
+                        
+                        if width > 0 and HAS_SHAPELY:
+                            line = LineString([(x1, y1), (x2, y2)])
+                            poly = line.buffer(width / 2.0, cap_style=1, join_style=1)
+                            if poly.is_valid and not poly.is_empty:
+                                raw_geometries.append(('POLYGON', list(poly.exterior.coords)))
+                        else:
+                            raw_geometries.append(('LINE', [(x1, y1), (x2, y2)]))
+                    
+                    elif item.tag == 'via':
+                        x, y = float(item.get('x', 0)), float(item.get('y', 0))
+                        drill = float(item.get('drill', 0.8))
+                        raw_geometries.append(('CIRCLE', ((x, y), float(item.get('diameter', drill * 1.6)) / 2.0)))
+                        
+                    elif item.tag == 'polygon':
+                        width = float(item.get('width', 0))
+                        pts = [(float(v.get('x')), float(v.get('y'))) for v in item.iter('vertex')]
+                        if len(pts) >= 3:
+                            if HAS_SHAPELY:
+                                poly = ShapelyPolygon(pts)
+                                if width > 0: poly = poly.buffer(width / 2.0, join_style=1)
+                                if poly.is_valid and not poly.is_empty:
+                                    raw_geometries.append(('POLYGON', list(poly.exterior.coords)))
+                            else:
+                                raw_geometries.append(('POLYGON', pts))
 
     def _parse_dxf(self, raw_geometries, max_error):
         doc = ezdxf.readfile(self.filepath)
         msp = doc.modelspace()
 
         diag = self.diagnostics
-        # None => proses semua layer (kompatibel dengan perilaku lama).
-        included_layers = self.config.get("dxf_included_layers")
-        # 'AUTO' (lama: poligon terbesar = outline), 'NONE' (jangan ekstrak outline),
-        # atau nama layer spesifik yang dipilih user di dialog seleksi layer.
-        outline_layer = self.config.get("dxf_outline_layer", "AUTO")
-
-        temp_polygons = []  # list of (ShapelyPolygon, source_layer_name)
-        temp_lines = []
-
-        def _get_open_polyline_width(entity, dxftype):
-            """Kembalikan lebar penuh (mm) sebuah polyline TERBUKA, yaitu jalur/trace
-            tembaga yang digambar sebagai garis tengah + properti lebar, bukan sebagai
-            poligon tertutup. Mengembalikan 0 jika tidak ada info lebar."""
-            if dxftype != 'LWPOLYLINE':
-                return 0.0
-            try:
-                const_w = getattr(entity.dxf, 'const_width', 0.0) or 0.0
-                if const_w > 0.0005:
-                    return const_w
-                widths = []
-                for pt in entity.get_points('xyseb'):
-                    sw, ew = pt[2], pt[3]
-                    if sw and sw > 0.0005: widths.append(sw)
-                    if ew and ew > 0.0005: widths.append(ew)
-                if widths:
-                    return max(widths)
-            except Exception:
-                pass
-            return 0.0
+        included_layers = self.config.get("included_layers")
 
         def _parse_entity(entity):
             dxftype = entity.dxftype()
@@ -272,16 +560,9 @@ class ParserWorkerThread(QThread):
                         (entity.dxf.vtx0.x, entity.dxf.vtx0.y), (entity.dxf.vtx1.x, entity.dxf.vtx1.y),
                         (entity.dxf.vtx3.x, entity.dxf.vtx3.y), (entity.dxf.vtx2.x, entity.dxf.vtx2.y)
                     ]
-                    poly = ShapelyPolygon(pts)
-                    if not poly.is_valid:
-                        poly = poly.buffer(0)
-                    if poly.is_valid and not poly.is_empty:
-                        if isinstance(poly, ShapelyPolygon):
-                            temp_polygons.append((poly, layer_name))
-                        elif isinstance(poly, MultiPolygon):
-                            for g in poly.geoms:
-                                temp_polygons.append((g, layer_name))
-                        used = True
+                    pts.append(pts[0])
+                    raw_geometries.append(('LINE', pts))
+                    used = True
                 elif dxftype in ('LWPOLYLINE', 'POLYLINE', 'LINE', 'ARC', 'ELLIPSE', 'SPLINE', 'HATCH'):
                     paths = ezdxf_path.make_paths_from_entity(entity) if hasattr(ezdxf_path, 'make_paths_from_entity') else [ezdxf_path.make_path(entity)]
                     for p in paths:
@@ -290,40 +571,9 @@ class ParserWorkerThread(QThread):
                         is_closed = True if p.is_closed or math.hypot(pts[0][0]-pts[-1][0], pts[0][1]-pts[-1][1]) < 0.001 else False
                         if is_closed:
                             if pts[0] != pts[-1]: pts.append(pts[0])
-                            poly = ShapelyPolygon(pts)
-                            if not poly.is_valid:
-                                poly = poly.buffer(0)
-                            if poly.is_valid and not poly.is_empty:
-                                if isinstance(poly, ShapelyPolygon):
-                                    temp_polygons.append((poly, layer_name))
-                                elif isinstance(poly, MultiPolygon):
-                                    for g in poly.geoms:
-                                        temp_polygons.append((g, layer_name))
-                                used = True
-                        else:
-                            # Jalur terbuka: jika entitas punya lebar (const_width /
-                            # per-vertex width) -- umum untuk trace tembaga yang
-                            # digambar sebagai centerline -- ubah menjadi poligon
-                            # solid sesuai lebar aslinya. Jika tidak ada info lebar,
-                            # pertahankan perilaku lama (garis tipis, dibuffer 0.02mm
-                            # nanti pada tahap union).
-                            width = _get_open_polyline_width(entity, dxftype)
-                            handled = False
-                            if width > 0.0005:
-                                try:
-                                    buffered = LineString(pts).buffer(width / 2.0, cap_style=2, join_style=2)
-                                    if isinstance(buffered, ShapelyPolygon) and not buffered.is_empty:
-                                        temp_polygons.append((buffered, layer_name))
-                                        handled = True
-                                    elif isinstance(buffered, MultiPolygon) and not buffered.is_empty:
-                                        for g in buffered.geoms:
-                                            temp_polygons.append((g, layer_name))
-                                        handled = True
-                                except Exception:
-                                    handled = False
-                            if not handled:
-                                temp_lines.append(LineString(pts))
-                            used = True
+                        
+                        raw_geometries.append(('LINE', pts))
+                        used = True
             except Exception:
                 diag["parse_errors"] += 1
                 return
@@ -339,44 +589,8 @@ class ParserWorkerThread(QThread):
                     diag["parse_errors"] += 1
             else: _parse_entity(entity)
             
-        if not raw_geometries and not temp_polygons and not temp_lines:
+        if not raw_geometries:
             for entity in doc.paperspace(): _parse_entity(entity)
-            
-        # --- Pemisahan Outline Papan vs Geometri Solid ---
-        for line in temp_lines:
-            raw_geometries.append(line)
-
-        if temp_polygons:
-            outline_polys = []
-            solid_polys = []
-
-            if outline_layer and outline_layer not in ('AUTO', 'NONE'):
-                # Mode eksplisit: user memilih satu layer di dialog sebagai sumber outline.
-                for poly, layer_name in temp_polygons:
-                    if layer_name == outline_layer:
-                        outline_polys.append(poly)
-                    else:
-                        solid_polys.append(poly)
-                diag["outline_source"] = f"layer: {outline_layer}"
-            elif outline_layer == 'NONE':
-                # User memilih untuk TIDAK mengekstrak outline sama sekali.
-                # Semua poligon tertutup diperlakukan sebagai geometri solid (pad/trace).
-                solid_polys = [poly for poly, _ in temp_polygons]
-                diag["outline_source"] = "none"
-            else:
-                # AUTO -- perilaku lama dipertahankan sebagai default: poligon dengan
-                # area terbesar diasumsikan sebagai outline papan (mis. Edge.Cuts).
-                sorted_polys = sorted(temp_polygons, key=lambda item: item[0].area, reverse=True)
-                largest_poly, largest_layer = sorted_polys[0]
-                if largest_poly.area > 0:
-                    outline_polys.append(largest_poly)
-                solid_polys = [poly for poly, _ in sorted_polys[1:]]
-                diag["outline_source"] = f"auto (layer: {largest_layer})"
-
-            for op in outline_polys:
-                raw_geometries.append(LineString(op.exterior.coords))
-            for sp in solid_polys:
-                raw_geometries.append(sp)
 
     def _parse_raster(self, raw_geometries):
         threshold_val = self.config.get("png_threshold", 0)
@@ -386,14 +600,12 @@ class ParserWorkerThread(QThread):
         if img is None:
             raise ValueError("File gambar tidak dapat dibaca.")
             
-        # Ubah BGR ke Grayscale agar merah (jalur) dan abu-abu (pad/teks) terbaca
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
         height, width = blurred.shape
         max_area = height * width * 0.40
 
-        # Gunakan THRESH_BINARY (tanpa INV) 
         if threshold_val <= 0:
             _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
@@ -439,7 +651,7 @@ class ParserWorkerThread(QThread):
                         samples = max(int(length), 10)
                         for i in range(samples + 1):
                             pt = path.point(i / samples)
-                            pts.append((pt.x * scale, -pt.y * scale)) # Inversi koordinat Y karena SVG 0,0 di atas kiri
+                            pts.append((pt.x * scale, -pt.y * scale))
                     if len(pts) >= 3:
                         raw_geometries.append(('POLYGON', pts))
             except Exception:
@@ -456,13 +668,12 @@ class ParserWorkerThread(QThread):
         gcode.append("G21 ; Millimeters")
         gcode.append("G90 ; Absolute positioning")
         gcode.append("M5  ; Laser OFF")
-        gcode.append(f"G0 F{config['max_feedrate_g0']}")
+        gcode.append("G0 X0.0000 Y0.0000 ; Home")
         gcode.append("")
 
-        passes = [
-            ("Pass 1: Ablation / Striping", config['laser_power_pass1']),
-            ("Pass 2: Clean Cut / Finishing", config['laser_power_pass2'])
-        ]
+        passes = []
+        for i, power in enumerate(config.get('phases_power', [])):
+            passes.append((f"Phase {i+1}", power))
 
         toolpaths = []
 
@@ -535,12 +746,13 @@ class ParserWorkerThread(QThread):
         gcode.append("G0 X0.0000 Y0.0000 ; Home")
         gcode.append("M30 ; End Program")
 
-        return "\n".join(gcode)
+        return "\n".join(gcode), toolpaths
 
 
 class FastPlotCanvas(FigureCanvas):
     def __init__(self, parent=None, title="High Precision PCB Solid View"):
-        fig = Figure(figsize=(5, 4), dpi=100)
+        # Hapus figsize=(5,4) agar fleksibel mengikuti jendela PyQt
+        fig = Figure(dpi=100) 
         self.axes = fig.add_subplot(111)
         self.title = title
         super().__init__(fig)
@@ -568,7 +780,6 @@ class FastPlotCanvas(FigureCanvas):
                 lines.append(data)
 
         if patches:
-            # pc = PatchCollection(patches, facecolors=fill_color, edgecolors=fill_color, alpha=0.9, antialiased=False)
             pc = PatchCollection(patches, facecolors=fill_color, edgecolors='none', linewidth=0, alpha=0.9, antialiased=False)
             self.axes.add_collection(pc)
 
@@ -577,127 +788,41 @@ class FastPlotCanvas(FigureCanvas):
             self.axes.add_collection(lc)
 
         self.axes.autoscale()
+        self.figure.tight_layout() # <-- Menghilangkan margin putih berlebih
         self.draw()
+        
+    def plot_toolpaths(self, toolpaths, line_color='blue'):
+        self.axes.clear()
+        self.axes.set_title("G-Code Toolpath View", fontsize=10, fontweight='bold')
+        self.axes.set_xlabel("X (mm)")
+        self.axes.set_ylabel("Y (mm)")
+        self.axes.grid(True, linestyle='--', alpha=0.3)
+        self.axes.set_aspect('equal', adjustable='box')
 
+        lines = []
+        for path in toolpaths:
+            if len(path) > 1:
+                lines.append(path)
 
-def scan_dxf_layers(filepath):
-    """Baca cepat sebuah file DXF hanya untuk menghitung jumlah entitas per layer
-    (termasuk entitas di dalam blok INSERT). Tidak melakukan konversi geometri
-    apapun, jadi ini aman dan murah dijalankan di main thread sebelum parsing
-    penuh dilakukan di worker thread."""
-    doc = ezdxf.readfile(filepath)
-    msp = doc.modelspace()
-    counts = Counter()
+        if lines:
+            lc = LineCollection(lines, colors=line_color, linewidths=0.6, antialiased=False)
+            self.axes.add_collection(lc)
 
-    def _count(entity):
-        layer_name = getattr(entity.dxf, 'layer', '0') or '0'
-        counts[layer_name] += 1
-
-    for entity in msp:
-        if entity.dxftype() == 'INSERT':
-            try:
-                for virt_ent in entity.virtual_entities():
-                    _count(virt_ent)
-            except Exception:
-                pass
-        else:
-            _count(entity)
-
-    if not counts:
-        for entity in doc.paperspace():
-            _count(entity)
-
-    return counts
-
-
-# Kata kunci layer yang secara default TIDAK dicentang, karena biasanya bukan
-# merupakan tembaga/jalur yang perlu di-routing (paste mask, lubang bor, dsb).
-# User tetap bisa mencentangnya kembali secara manual di dialog.
-_DXF_LAYER_DEFAULT_EXCLUDE_KEYWORDS = (
-    'paste', 'hole', 'drill', 'silk', 'dimension', 'comment',
-    'keepout', 'assembly', 'courtyard', 'doc', 'note'
-)
-
-
-class LayerSelectionDialog(QDialog):
-    """Dialog untuk memilih layer DXF mana yang akan diproses, serta layer mana
-    (jika ada) yang merepresentasikan outline/batas papan. Dibuat karena file DXF
-    dari software ECAD (Eagle/KiCad/dll) sering menaruh tembaga, paste mask,
-    lubang bor, dan sebagainya dalam layer terpisah -- menggabungkan semuanya
-    tanpa pandang bulu menghasilkan geometri yang kacau/menyatu."""
-
-    def __init__(self, layer_counts, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Pilih Layer DXF")
-        self.resize(420, 480)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "File DXF ini berisi beberapa layer. Pilih layer mana saja yang\n"
-            "merupakan tembaga/jalur yang ingin diproses (default sudah\n"
-            "disarankan berdasarkan nama layer)."
-        ))
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-
-        self.checkboxes = {}
-        for layer_name in sorted(layer_counts.keys()):
-            count = layer_counts[layer_name]
-            cb = QCheckBox(f"{layer_name}  ({count} entitas)")
-            lname_lower = layer_name.lower()
-            default_checked = not any(kw in lname_lower for kw in _DXF_LAYER_DEFAULT_EXCLUDE_KEYWORDS)
-            cb.setChecked(default_checked)
-            scroll_layout.addWidget(cb)
-            self.checkboxes[layer_name] = cb
-
-        scroll_layout.addStretch(1)
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll)
-
-        outline_box = QGroupBox("Sumber Outline Papan")
-        outline_layout = QVBoxLayout(outline_box)
-        outline_layout.addWidget(QLabel("Layer mana yang merupakan batas/outline papan?"))
-        self.combo_outline = QComboBox()
-        self.combo_outline.addItem("Otomatis (poligon area terbesar)", "AUTO")
-        self.combo_outline.addItem("Tidak ada / jangan ekstrak outline", "NONE")
-        for layer_name in sorted(layer_counts.keys()):
-            self.combo_outline.addItem(layer_name, layer_name)
-        outline_layout.addWidget(self.combo_outline)
-        layout.addWidget(outline_box)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def get_included_layers(self):
-        included = [name for name, cb in self.checkboxes.items() if cb.isChecked()]
-        # Jika user tanpa sengaja mencentang nol layer, jangan kunci ke daftar
-        # kosong (yang berarti "tidak ada apa-apa") -- perlakukan sebagai semua.
-        if not included:
-            return None
-        if len(included) == len(self.checkboxes):
-            return None  # semua dicentang -> sama dengan tidak difilter
-        return included
-
-    def get_outline_layer(self):
-        return self.combo_outline.currentData()
+        self.axes.autoscale()
+        self.figure.tight_layout() # <-- Menghilangkan margin putih berlebih
+        self.draw()
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sculpfun C1 Mini - Multi-Format (DXF/PNG/SVG) to PCB G-Code")
+        self.setWindowTitle("Sculpfun C1 Mini - Multi-Format (DXF/BRD/PNG/SVG) to PCB G-Code")
         self.resize(1250, 850)
 
         self.current_parsed_shapes = []
         self.filepath = ""
         self.worker = None
-        # None = belum ada filter (semua layer diproses, sama seperti perilaku lama).
-        self.dxf_layer_config = {"dxf_included_layers": None, "dxf_outline_layer": "AUTO"}
+        self.layer_config = {"included_layers": None, "outline_layer": "AUTO"}
 
         self.init_ui()
 
@@ -725,7 +850,6 @@ class MainWindow(QMainWindow):
         config_grid.addWidget(self.combo_mode, 0, 1)
 
         self.inputs = {}
-        # Menambahkan parameter Scale dan Threshold ke UI
         default_config = [
             ("Curve Precision Error (mm)", "flattening_max_error", "0.01"),
             ("Spot Size X (mm)", "spot_size_x", "0.06"),
@@ -736,8 +860,6 @@ class MainWindow(QMainWindow):
             ("Max G1 Feedrate (mm/min)", "max_feedrate_g1", "1000"),
             ("Acceleration (mm/s²)", "acceleration", "500"),
             ("Laser Power Max ($30)", "laser_power_max", "1000"),
-            ("Laser Power Pass 1 (S)", "laser_power_pass1", "700"),
-            ("Laser Power Pass 2 (S)", "laser_power_pass2", "450"),
         ]
 
         row = 1
@@ -748,28 +870,52 @@ class MainWindow(QMainWindow):
             self.inputs[key] = txt_input
             row += 1
 
+        drl_layout = QHBoxLayout()
+        self.chk_drl = QCheckBox("DRL Test")
+        self.btn_check_drl = QPushButton("Check")
+        self.btn_check_drl.clicked.connect(self.run_drl_check)
+        
+        drl_layout.addWidget(self.chk_drl)
+        drl_layout.addWidget(self.btn_check_drl)
+        
+        config_grid.addLayout(drl_layout, row, 0, 1, 2)
+		
         left_layout.addWidget(config_box)
 
         btn_layout = QHBoxLayout()
-        self.btn_open = QPushButton("1. Open File (DXF/PNG/SVG)")
+        self.btn_open = QPushButton("Open File")
         self.btn_open.clicked.connect(self.open_file)
         btn_layout.addWidget(self.btn_open)
 
-        self.btn_layers = QPushButton("Layer DXF...")
-        self.btn_layers.setToolTip("Pilih layer DXF mana yang diproses dan mana yang menjadi outline papan.")
-        self.btn_layers.clicked.connect(self.configure_dxf_layers)
+        self.btn_layers = QPushButton("Pilih Layer...")
+        self.btn_layers.setToolTip("Pilih layer mana yang diproses (DXF/BRD).")
+        self.btn_layers.clicked.connect(self.configure_layers)
         self.btn_layers.setEnabled(False)
         btn_layout.addWidget(self.btn_layers)
 
-        self.btn_convert = QPushButton("2. Convert G-Code")
+        self.btn_convert = QPushButton("Convert G-Code")
         self.btn_convert.clicked.connect(self.convert_file_to_gcode)
         btn_layout.addWidget(self.btn_convert)
 
-        self.btn_export = QPushButton("3. Export File")
+        self.btn_export = QPushButton("Export")
         self.btn_export.clicked.connect(self.export_gcode)
         btn_layout.addWidget(self.btn_export)
 
         left_layout.addLayout(btn_layout)
+        
+        self.phase_inputs = [] 
+        phases_group = QGroupBox("Laser Phases (Passes)")
+        self.phases_layout = QVBoxLayout(phases_group)
+        
+        self.btn_tambah_phase = QPushButton("➕ Tambah Phase")
+        self.btn_tambah_phase.setStyleSheet("background-color: #2980b9; color: white;")
+        self.btn_tambah_phase.clicked.connect(self.add_phase)
+        self.phases_layout.addWidget(self.btn_tambah_phase)
+        
+        self.add_phase("700") 
+                
+        left_layout.addWidget(config_box)
+        left_layout.addWidget(phases_group) 
 
         editor_box = QGroupBox("G-Code Preview")
         editor_layout = QVBoxLayout(editor_box)
@@ -782,6 +928,15 @@ class MainWindow(QMainWindow):
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
+        
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(QLabel("Preview Mode:"))
+        self.combo_preview = QComboBox()
+        self.combo_preview.addItems(["1. Design (Solid Area)", "2. G-Code (Laser Toolpaths)"])
+        self.combo_preview.currentIndexChanged.connect(self.update_preview)
+        preview_layout.addWidget(self.combo_preview)
+        preview_layout.addStretch()
+        right_layout.addLayout(preview_layout)
 
         canvas_container = QWidget()
         canvas_vbox = QVBoxLayout(canvas_container)
@@ -793,6 +948,22 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(right_panel)
         splitter.setSizes([450, 800])
+        
+    def add_phase(self, default_power=False):
+        if not isinstance(default_power, str):
+            default_power = "1000" 
+
+        phase_index = len(self.phase_inputs) + 1
+        
+        row_layout = QHBoxLayout()
+        lbl = QLabel(f"Phase {phase_index} Power (S):")
+        inp = QLineEdit(default_power)
+        
+        row_layout.addWidget(lbl)
+        row_layout.addWidget(inp)
+        
+        self.phases_layout.insertLayout(self.phases_layout.count() - 1, row_layout)
+        self.phase_inputs.append(inp)
 
     def get_config_dict(self):
         try:
@@ -807,8 +978,8 @@ class MainWindow(QMainWindow):
                 "max_feedrate_g1": float(self.inputs["max_feedrate_g1"].text()),
                 "acceleration": float(self.inputs["acceleration"].text()),
                 "laser_power_max": int(self.inputs["laser_power_max"].text()),
-                "laser_power_pass1": int(self.inputs["laser_power_pass1"].text()),
-                "laser_power_pass2": int(self.inputs["laser_power_pass2"].text()),
+                "use_drl_rules": self.chk_drl.isChecked(),
+                "phases_power": [int(inp.text()) for inp in self.phase_inputs]
             }
         except ValueError as e:
             QMessageBox.critical(self, "Input Error", f"Format parameter tidak valid: {str(e)}")
@@ -817,53 +988,107 @@ class MainWindow(QMainWindow):
     def open_file(self):
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Buka File", "", 
-            "Supported Files (*.dxf *.png *.svg);;DXF Files (*.dxf);;PNG Files (*.png);;SVG Files (*.svg)"
+            "Supported Files (*.dxf *.brd *.png *.svg);;DXF Files (*.dxf);;BRD Files (*.brd);;PNG Files (*.png);;SVG Files (*.svg)"
         )
         if not filepath:
             return
 
         self.filepath = filepath
-        # Reset filter setiap kali file baru dibuka.
-        self.dxf_layer_config = {"dxf_included_layers": None, "dxf_outline_layer": "AUTO"}
-        is_dxf = filepath.lower().endswith('.dxf')
-        self.btn_layers.setEnabled(is_dxf)
+        self.layer_config = {"included_layers": None, "outline_layer": "AUTO"}
+        
+        is_layered_file = filepath.lower().endswith('.dxf') or filepath.lower().endswith('.brd')
+        self.btn_layers.setEnabled(is_layered_file)
 
-        if is_dxf:
-            if not self._prompt_dxf_layer_selection(filepath):
-                # User membatalkan dialog seleksi layer -- jangan langsung memproses.
+        if is_layered_file:
+            if not self._prompt_layer_selection(filepath):
                 return
 
         self.convert_file_to_gcode()
 
-    def _prompt_dxf_layer_selection(self, filepath):
-        """Scan layer DXF dan tampilkan dialog seleksi. Mengembalikan True jika
-        user menekan OK (config disimpan ke self.dxf_layer_config), False jika
-        dibatalkan atau file gagal dipindai."""
+    def _prompt_layer_selection(self, filepath):
         try:
-            layer_counts = scan_dxf_layers(filepath)
+            object_counts = None
+            if filepath.lower().endswith('.dxf'):
+                layer_counts = scan_dxf_layers(filepath)
+            elif filepath.lower().endswith('.brd'):
+                # Bagian ini yang sebelumnya error, sekarang kita tangkap 3 nilai
+                layer_counts, _, object_counts = scan_brd_layers(filepath)
         except Exception as e:
-            QMessageBox.critical(self, "Gagal Membaca DXF", f"Tidak dapat memindai layer DXF:\n{str(e)}")
+            QMessageBox.critical(self, "Gagal Membaca File", f"Tidak dapat memindai layer:\n{str(e)}")
             return False
 
         if not layer_counts:
-            QMessageBox.warning(self, "Warning", "Tidak ada entitas yang ditemukan di dalam file DXF ini.")
+            QMessageBox.warning(self, "Warning", "Tidak ada entitas ber-layer yang ditemukan di dalam file ini.")
             return False
 
-        dialog = LayerSelectionDialog(layer_counts, self)
+        # Memasukkan object_counts ke dalam dialog
+        dialog = LayerSelectionDialog(layer_counts, object_counts, self)
         if dialog.exec_() != QDialog.Accepted:
             return False
 
-        self.dxf_layer_config = {
-            "dxf_included_layers": dialog.get_included_layers(),
-            "dxf_outline_layer": dialog.get_outline_layer(),
+        self.layer_config = {
+            "included_layers": dialog.get_included_layers(),
+            "included_objects": dialog.get_included_objects(),
+            "outline_layer": "AUTO" # Tetap simpan parameter ini agar tidak error di bagian lain
         }
         return True
 
-    def configure_dxf_layers(self):
-        if not self.filepath or not self.filepath.lower().endswith('.dxf'):
-            QMessageBox.warning(self, "Warning", "Buka file DXF terlebih dahulu!")
+    def configure_layers(self):
+        is_layered_file = self.filepath.lower().endswith('.dxf') or self.filepath.lower().endswith('.brd')
+        if not self.filepath or not is_layered_file:
+            QMessageBox.warning(self, "Warning", "Buka file DXF atau BRD terlebih dahulu!")
             return
-        self._prompt_dxf_layer_selection(self.filepath)
+        
+        if self._prompt_layer_selection(self.filepath):
+            self.convert_file_to_gcode()
+
+    def run_drl_check(self):
+        if not self.current_parsed_shapes:
+            QMessageBox.warning(self, "DRL Check", "Muat file terlebih dahulu (Viewer mode).")
+            return
+            
+        if not HAS_SHAPELY:
+            QMessageBox.warning(self, "DRL Check", "Library Shapely tidak terinstal. DRL tidak dapat dijalankan.")
+            return
+
+        try:
+            spot_size = float(self.inputs["spot_size_x"].text())
+            min_clearance = spot_size
+        except ValueError:
+            min_clearance = 0.06
+
+        shapely_geoms = []
+        for shape_type, data in self.current_parsed_shapes:
+            try:
+                if shape_type == 'LINE':
+                    geom = LineString(data)
+                    if geom.is_valid: shapely_geoms.append(geom)
+                elif shape_type == 'POLYGON':
+                    geom = ShapelyPolygon(data)
+                    if not geom.is_valid: geom = geom.buffer(0)
+                    if geom.is_valid: shapely_geoms.append(geom)
+                elif shape_type == 'CIRCLE':
+                    center, radius = data
+                    geom = Point(center).buffer(max(radius, 0.001), resolution=32)
+                    if geom.is_valid: shapely_geoms.append(geom)
+            except Exception:
+                continue
+
+        violations = 0
+        total_geoms = len(shapely_geoms)
+        
+        for i in range(total_geoms):
+            for j in range(i + 1, total_geoms):
+                dist = shapely_geoms[i].distance(shapely_geoms[j])
+                
+                if 0.001 < dist < min_clearance:
+                    violations += 1
+
+        if violations > 0:
+            msg = f"Ditemukan Pelanggaran DRL!\n\nAda {violations} area yang jarak antar jalurnya lebih kecil dari ukuran spot laser (< {min_clearance} mm).\nIni berisiko menyebabkan short-circuit (jalur menyatu/tidak terpotong sempurna)."
+            QMessageBox.warning(self, "DRL Check Result", msg)
+        else:
+            QMessageBox.information(self, "DRL Check Result", "Desain Aman!\nTidak ditemukan jalur yang jaraknya melanggar batas spot size laser.")
 
     def convert_file_to_gcode(self):
         if not self.filepath:
@@ -874,8 +1099,8 @@ class MainWindow(QMainWindow):
         if not config:
             return
 
-        if self.filepath.lower().endswith('.dxf'):
-            config.update(self.dxf_layer_config)
+        if self.filepath.lower().endswith('.dxf') or self.filepath.lower().endswith('.brd'):
+            config.update(self.layer_config)
 
         self.btn_open.setEnabled(False)
         self.btn_layers.setEnabled(False)
@@ -887,15 +1112,18 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self.on_processing_error)
         self.worker.start()
 
-    def on_processing_finished(self, parsed_shapes, gcode_str):
+    def on_processing_finished(self, parsed_shapes, gcode_str, toolpaths):
         self.current_parsed_shapes = parsed_shapes
-        self.canvas.plot_data(self.current_parsed_shapes, fill_color='red')
+        self.current_toolpaths = toolpaths
+        
+        self.update_preview()
         
         self.gcode_editor.clear()
         self.gcode_editor.setText(gcode_str)
 
         self.btn_open.setEnabled(True)
-        self.btn_layers.setEnabled(self.filepath.lower().endswith('.dxf'))
+        is_layered_file = self.filepath.lower().endswith('.dxf') or self.filepath.lower().endswith('.brd')
+        self.btn_layers.setEnabled(is_layered_file)
         self.btn_convert.setEnabled(True)
         self.btn_convert.setText("2. Convert G-Code")
 
@@ -903,7 +1131,7 @@ class MainWindow(QMainWindow):
 
         diag = getattr(self.worker, "diagnostics", None) if self.worker else None
         if diag and diag.get("layers_seen"):
-            summary += "\n\n--- Rincian Layer DXF ---"
+            summary += "\n\n--- Rincian Layer Terdeteksi ---"
             for layer_name in sorted(diag["layers_seen"].keys()):
                 seen = diag["layers_seen"][layer_name]
                 included = diag["layers_included"].get(layer_name, 0)
@@ -912,8 +1140,6 @@ class MainWindow(QMainWindow):
                     summary += f"\n{layer_name}: {seen} entitas (dilewati/di-filter)"
                 else:
                     summary += f"\n{layer_name}: {seen} entitas ({included} terpakai)"
-            if diag.get("outline_source"):
-                summary += f"\nSumber outline: {diag['outline_source']}"
             if diag.get("parse_errors"):
                 summary += f"\nEntitas gagal dibaca: {diag['parse_errors']}"
 
@@ -921,7 +1147,8 @@ class MainWindow(QMainWindow):
 
     def on_processing_error(self, err_msg):
         self.btn_open.setEnabled(True)
-        self.btn_layers.setEnabled(self.filepath.lower().endswith('.dxf') if self.filepath else False)
+        is_layered_file = self.filepath.lower().endswith('.dxf') or self.filepath.lower().endswith('.brd') if self.filepath else False
+        self.btn_layers.setEnabled(is_layered_file)
         self.btn_convert.setEnabled(True)
         self.btn_convert.setText("2. Convert G-Code")
         QMessageBox.critical(self, "Parsing Error", f"Gagal membaca file: {err_msg}")
@@ -942,7 +1169,16 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Success", f"File G-Code berhasil disimpan ke:\n{filepath}")
             except Exception as e:
                 QMessageBox.critical(self, "Save Error", f"Gagal menyimpan file: {str(e)}")
-
+                
+    def update_preview(self):
+        idx = self.combo_preview.currentIndex()
+        if idx == 0:
+            self.canvas.plot_data(self.current_parsed_shapes, fill_color='red')
+        elif idx == 1:
+            if hasattr(self, 'current_toolpaths') and self.current_toolpaths:
+                self.canvas.plot_toolpaths(self.current_toolpaths, line_color='blue')
+            else:
+                self.canvas.plot_toolpaths([]) 
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
