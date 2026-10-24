@@ -7,11 +7,21 @@ import cv2
 import numpy as np
 import xml.etree.ElementTree as ET
 
+import os
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = ""
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
 try:
     from svgelements import SVG, Path as SVGPath
     HAS_SVG = True
 except ImportError:
     HAS_SVG = False
+
+try:
+    import gerber
+    HAS_GERBER = True
+except ImportError:
+    HAS_GERBER = False
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -192,6 +202,11 @@ class ParserWorkerThread(QThread):
                 self._parse_dxf(raw_geometries, max_error)
             elif ext == 'brd':
                 self._parse_brd(raw_geometries)
+            elif ext in ['gbr', 'gtl', 'gbl', 'gbp', 'gbo']:
+                if not HAS_GERBER:
+                    self.error.emit("Library 'pcb-tools' belum terinstal!\nKetik di terminal: pip install pcb-tools")
+                    return
+                self._parse_gerber(raw_geometries)
             elif ext in ['png', 'jpg', 'jpeg']:
                 self._parse_raster(raw_geometries) 
             elif ext == 'svg':
@@ -375,6 +390,137 @@ class ParserWorkerThread(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
+
+    def _parse_gerber(self, raw_geometries):
+        import builtins
+        _original_open = builtins.open
+        
+        # Fungsi pencegat untuk memanipulasi mode pembacaan file dari 'rU' menjadi 'r'
+        def _safe_open(*args, **kwargs):
+            if len(args) > 1 and args[1] == 'rU':
+                args = list(args)
+                args[1] = 'r'
+                args = tuple(args)
+            if kwargs.get('mode') == 'rU':
+                kwargs['mode'] = 'r'
+            return _original_open(*args, **kwargs)
+
+        try:
+            # Patch builtins.open sementara untuk menambal bug pcb-tools di Python 3.11+
+            builtins.open = _safe_open
+            cam = gerber.read(self.filepath)
+            builtins.open = _original_open # Kembalikan ke aslinya
+            
+            cam.to_metric() # Paksa satuan milimeter
+            
+            # Fungsi bantuan untuk menghaluskan lengkungan Arc (interpolasi sudut)
+            def get_arc_points(start, end, center, direction, num_points=16):
+                cx, cy = center
+                sx, sy = start
+                ex, ey = end
+                
+                angle_start = math.atan2(sy - cy, sx - cx)
+                angle_end = math.atan2(ey - cy, ex - cx)
+                
+                if direction == 'counterclockwise':
+                    if angle_end <= angle_start:
+                        angle_end += 2 * math.pi
+                else: # clockwise
+                    if angle_end >= angle_start:
+                        angle_start += 2 * math.pi
+                        
+                pts = []
+                r = math.hypot(sx - cx, sy - cy)
+                
+                for i in range(num_points + 1):
+                    t = i / num_points
+                    angle = angle_start + (angle_end - angle_start) * t
+                    pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+                    
+                return pts
+
+            for prim in cam.primitives:
+                p_type = type(prim).__name__
+                
+                # 1. Parsing Jalur (Line/Tracks)
+                if p_type == 'Line':
+                    p1, p2 = prim.start, prim.end
+                    width = 0
+                    if hasattr(prim, 'aperture') and prim.aperture:
+                        width = getattr(prim.aperture, 'diameter', getattr(prim.aperture, 'width', 0))
+                    
+                    if width > 0 and HAS_SHAPELY:
+                        line = LineString([p1, p2])
+                        poly = line.buffer(width / 2.0, cap_style=1, join_style=1)
+                        if poly.is_valid and not poly.is_empty:
+                            raw_geometries.append(('POLYGON', list(poly.exterior.coords)))
+                    else:
+                        raw_geometries.append(('LINE', [p1, p2]))
+                
+                # 2. Parsing Pad Bulat / Vias
+                elif p_type == 'Circle':
+                    center = prim.position
+                    radius = getattr(prim, 'radius', getattr(prim, 'diameter', 0) / 2.0)
+                    if radius > 0:
+                        raw_geometries.append(('CIRCLE', (center, radius)))
+                        
+                # 3. Parsing Pad Kotak (SMD)
+                elif p_type == 'Rectangle':
+                    x, y = prim.position
+                    w, h = prim.width, prim.height
+                    pts = [(x-w/2, y-h/2), (x+w/2, y-h/2), (x+w/2, y+h/2), (x-w/2, y+h/2)]
+                    raw_geometries.append(('POLYGON', pts))
+                    
+                # 4. Parsing Pad Kapsul (Obround)
+                elif p_type == 'Obround':
+                    x, y = prim.position
+                    w, h = prim.width, prim.height
+                    if HAS_SHAPELY:
+                        if w > h:
+                            line = LineString([(x - w/2 + h/2, y), (x + w/2 - h/2, y)])
+                            poly = line.buffer(h/2, resolution=16)
+                        else:
+                            line = LineString([(x, y - h/2 + w/2), (x, y + h/2 - w/2)])
+                            poly = line.buffer(w/2, resolution=16)
+                        if poly.is_valid and not poly.is_empty:
+                            raw_geometries.append(('POLYGON', list(poly.exterior.coords)))
+                    else:
+                        pts = [(x-w/2, y-h/2), (x+w/2, y-h/2), (x+w/2, y+h/2), (x-w/2, y+h/2)]
+                        raw_geometries.append(('POLYGON', pts))
+                        
+                # 5. Parsing Area Tembaga Lebar (Regions / Polygons)
+                elif p_type == 'Region':
+                    pts = []
+                    for b_prim in prim.primitives:
+                        b_type = type(b_prim).__name__
+                        if b_type == 'Line':
+                            if not pts: pts.append(b_prim.start)
+                            pts.append(b_prim.end)
+                        elif b_type == 'Arc':
+                            arc_pts = get_arc_points(b_prim.start, b_prim.end, b_prim.center, b_prim.direction)
+                            if not pts: pts.extend(arc_pts)
+                            else: pts.extend(arc_pts[1:]) # Hindari titik ganda (overlap)
+                    if len(pts) >= 3:
+                        raw_geometries.append(('POLYGON', pts))
+
+                # 6. Parsing Jalur Melengkung (Standalone Arcs)
+                elif p_type == 'Arc':
+                    width = 0
+                    if hasattr(prim, 'aperture') and prim.aperture:
+                        width = getattr(prim.aperture, 'diameter', getattr(prim.aperture, 'width', 0))
+                        
+                    arc_pts = get_arc_points(prim.start, prim.end, prim.center, prim.direction)
+                    if width > 0 and HAS_SHAPELY:
+                        line = LineString(arc_pts)
+                        poly = line.buffer(width / 2.0, cap_style=1, join_style=1)
+                        if poly.is_valid and not poly.is_empty:
+                            raw_geometries.append(('POLYGON', list(poly.exterior.coords)))
+                    else:
+                        raw_geometries.append(('LINE', arc_pts))
+                        
+        except Exception as e:
+            self.diagnostics["parse_errors"] += 1
+            print(f"Gerber Parsing Error: {e}")
 
     def _parse_brd(self, raw_geometries):
         tree = ET.parse(self.filepath)
@@ -626,7 +772,7 @@ class ParserWorkerThread(QThread):
                     
                     if parent_idx == -1:
                         if area < max_area: 
-                            polygons[i] = pts
+                            polygons[i] = polygons.get(i, pts)
                     else:
                         if parent_idx not in holes:
                             holes[parent_idx] = []
@@ -751,7 +897,6 @@ class ParserWorkerThread(QThread):
 
 class FastPlotCanvas(FigureCanvas):
     def __init__(self, parent=None, title="High Precision PCB Solid View"):
-        # Hapus figsize=(5,4) agar fleksibel mengikuti jendela PyQt
         fig = Figure(dpi=100) 
         self.axes = fig.add_subplot(111)
         self.title = title
@@ -788,7 +933,7 @@ class FastPlotCanvas(FigureCanvas):
             self.axes.add_collection(lc)
 
         self.axes.autoscale()
-        self.figure.tight_layout() # <-- Menghilangkan margin putih berlebih
+        self.figure.tight_layout() 
         self.draw()
         
     def plot_toolpaths(self, toolpaths, line_color='blue'):
@@ -809,14 +954,14 @@ class FastPlotCanvas(FigureCanvas):
             self.axes.add_collection(lc)
 
         self.axes.autoscale()
-        self.figure.tight_layout() # <-- Menghilangkan margin putih berlebih
+        self.figure.tight_layout() 
         self.draw()
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sculpfun C1 Mini - Multi-Format (DXF/BRD/PNG/SVG) to PCB G-Code")
+        self.setWindowTitle("Sculpfun C1 Mini - Multi-Format (DXF/BRD/GBR/PNG/SVG) to PCB G-Code")
         self.resize(1250, 850)
 
         self.current_parsed_shapes = []
@@ -988,7 +1133,7 @@ class MainWindow(QMainWindow):
     def open_file(self):
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Buka File", "", 
-            "Supported Files (*.dxf *.brd *.png *.svg);;DXF Files (*.dxf);;BRD Files (*.brd);;PNG Files (*.png);;SVG Files (*.svg)"
+            "Supported Files (*.dxf *.brd *.gbr *.gtl *.gbl *.png *.svg);;DXF Files (*.dxf);;BRD Files (*.brd);;Gerber Files (*.gbr *.gtl *.gbl *.gbp *.gbo);;PNG Files (*.png);;SVG Files (*.svg)"
         )
         if not filepath:
             return
@@ -999,6 +1144,8 @@ class MainWindow(QMainWindow):
         is_layered_file = filepath.lower().endswith('.dxf') or filepath.lower().endswith('.brd')
         self.btn_layers.setEnabled(is_layered_file)
 
+        # File Gerber biasanya hanya terdiri dari 1 layer per file (Top saja atau Bottom saja),
+        # sehingga tidak butuh Dialog Pemilihan Layer. Bisa langsung dikonversi!
         if is_layered_file:
             if not self._prompt_layer_selection(filepath):
                 return
@@ -1011,7 +1158,6 @@ class MainWindow(QMainWindow):
             if filepath.lower().endswith('.dxf'):
                 layer_counts = scan_dxf_layers(filepath)
             elif filepath.lower().endswith('.brd'):
-                # Bagian ini yang sebelumnya error, sekarang kita tangkap 3 nilai
                 layer_counts, _, object_counts = scan_brd_layers(filepath)
         except Exception as e:
             QMessageBox.critical(self, "Gagal Membaca File", f"Tidak dapat memindai layer:\n{str(e)}")
@@ -1021,7 +1167,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Tidak ada entitas ber-layer yang ditemukan di dalam file ini.")
             return False
 
-        # Memasukkan object_counts ke dalam dialog
         dialog = LayerSelectionDialog(layer_counts, object_counts, self)
         if dialog.exec_() != QDialog.Accepted:
             return False
@@ -1029,7 +1174,7 @@ class MainWindow(QMainWindow):
         self.layer_config = {
             "included_layers": dialog.get_included_layers(),
             "included_objects": dialog.get_included_objects(),
-            "outline_layer": "AUTO" # Tetap simpan parameter ini agar tidak error di bagian lain
+            "outline_layer": "AUTO" 
         }
         return True
 
