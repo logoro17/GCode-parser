@@ -11,6 +11,16 @@ import os
 os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = ""
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+# --- CROSS-PLATFORM MINGW DLL LOADER (WINDOWS ONLY) ---
+if sys.platform == "win32":
+    import shutil
+    gcc_path = shutil.which("g++") or shutil.which("gcc")
+    if gcc_path:
+        try:
+            os.add_dll_directory(os.path.dirname(gcc_path))
+        except Exception:
+            pass
+
 try:
     from svgelements import SVG, Path as SVGPath
     HAS_SVG = True
@@ -27,17 +37,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog, 
     QTextEdit, QGroupBox, QSplitter, QMessageBox, QComboBox,
-    QDialog, QCheckBox, QScrollArea, QDialogButtonBox
+    QDialog, QCheckBox, QScrollArea, QDialogButtonBox, QGraphicsView, QGraphicsScene
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-
-import matplotlib
-matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.collections import LineCollection, PatchCollection
-from matplotlib.patches import Polygon as MplPolygon, Circle as MplCircle
-from matplotlib.figure import Figure
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF
+from PyQt5.QtGui import QPainter, QPainterPath, QPen, QColor, QBrush, QFont, QTransform
 
 try:
     from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon, LineString, Point
@@ -47,6 +50,396 @@ except ImportError:
     HAS_SHAPELY = False
 
 
+# ==============================================================================
+# LASERGRBL STYLE 2D CANVAS VISUALIZER (PyQt5 QGraphicsView)
+# ==============================================================================
+class GCodeCanvas(QGraphicsView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+
+        # 1. Atur batas area scene agar dapat dipan tanpa batas scrollbar
+        self.scene.setSceneRect(-5000, -5000, 10000, 10000)
+
+        # 2. Sembunyikan scrollbar bawaan
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Config Render
+        self.setRenderHint(QPainter.Antialiasing, False)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+        self.setFocusPolicy(Qt.StrongFocus)
+        
+        # Invert Sumbu Y (Layar Y-down ke CNC Y-up)
+        self.scale(1, -1)
+
+        # State Panning & Mouse Tracking
+        self.is_panning = False
+        self.last_mouse_pos = QPointF()
+        self.cursor_pos = QPointF(0.0, 0.0)
+        self.mco_pos = QPointF(0.0, 0.0)
+        
+        self.setMouseTracking(True)
+        self.is_auto_process = False
+
+    def plot_all_gcode(self, gcode_text):
+        """Memetakan seluruh G-Code (G0 Rapid Travel & G1 Cutting) langsung dari teks G-Code"""
+        self.scene.clear()
+        if not gcode_text.strip():
+            return
+
+        path_cutting = QPainterPath()  # G1
+        path_travel = QPainterPath()   # G0
+
+        cur_x, cur_y = 0.0, 0.0
+        cur_mode = "G0" # Default modal
+
+        for line in gcode_text.splitlines():
+            # Clean comment
+            line = line.split(';')[0].strip()
+            if not line:
+                continue
+
+            tokens = line.split()
+            has_x, has_y = False, False
+            next_x, next_y = cur_x, cur_y
+
+            for token in tokens:
+                prefix = token[0].upper()
+                val_str = token[1:]
+                
+                if prefix == 'G':
+                    try:
+                        g_num = int(float(val_str))
+                        if g_num == 0: cur_mode = "G0"
+                        elif g_num == 1: cur_mode = "G1"
+                    except ValueError: pass
+                elif prefix == 'X':
+                    try: next_x = float(val_str); has_x = True
+                    except ValueError: pass
+                elif prefix == 'Y':
+                    try: next_y = float(val_str); has_y = True
+                    except ValueError: pass
+
+            if has_x or has_y:
+                if cur_mode == "G1":
+                    path_cutting.moveTo(cur_x, cur_y)
+                    path_cutting.lineTo(next_x, next_y)
+                else:  # G0 Rapid
+                    path_travel.moveTo(cur_x, cur_y)
+                    path_travel.lineTo(next_x, next_y)
+
+                cur_x, cur_y = next_x, next_y
+
+        pen_g1 = QPen(QColor("#0000FF"), 0) # Biru untuk G1 Cutting
+        pen_g0 = QPen(QColor("#FF0000"), 0, Qt.DashLine) # Merah Putus-putus untuk G0 Travel
+
+        self.scene.addPath(path_cutting, pen_g1)
+        self.scene.addPath(path_travel, pen_g0)
+
+        if not self.scene.itemsBoundingRect().isEmpty():
+            self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+
+    # --- PANNING MEKANISME VIA SCROLLBAR ---
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.is_panning = True
+            self.last_mouse_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.is_panning:
+            delta = event.pos() - self.last_mouse_pos
+            self.last_mouse_pos = event.pos()
+
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+
+            self.viewport().update()
+            event.accept()
+            return
+
+        scene_pt = self.mapToScene(event.pos())
+        self.cursor_pos = scene_pt
+        self.viewport().update()
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.is_panning = False
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        zoom_factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(zoom_factor, zoom_factor)
+        self.viewport().update()
+
+    def keyPressEvent(self, event):
+        if event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_A:
+            if not self.scene.itemsBoundingRect().isEmpty():
+                self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+            event.accept()
+        elif event.modifiers() == Qt.ControlModifier and event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.scale(1.10, 1.10)
+            self.viewport().update()
+            event.accept()
+        elif event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_Minus:
+            self.scale(0.90, 0.90)
+            self.viewport().update()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def _calculate_dynamic_step(self, target_px=60):
+        """Menghitung step grid (mm) agar jarak antar garis di layar ~60px"""
+        zoom_scale = abs(self.transform().m11())
+        if zoom_scale <= 0:
+            zoom_scale = 1.0
+
+        # Berapa mm dalam kisaran target_px layar
+        raw_units = target_px / zoom_scale
+
+        # Logaritma basis 10 untuk menentukan orde besaran
+        exponent = math.floor(math.log10(raw_units))
+        fraction = raw_units / (10 ** exponent)
+
+        # Bulatkan ke kelipatan terdekat (1, 2, atau 5)
+        if fraction < 1.5:
+            nice_fraction = 1.0
+        elif fraction < 3.5:
+            nice_fraction = 2.0
+        elif fraction < 7.5:
+            nice_fraction = 5.0
+        else:
+            nice_fraction = 10.0
+
+        grid_step = nice_fraction * (10 ** exponent)
+        return grid_step, zoom_scale
+
+    def drawBackground(self, painter, rect):
+        painter.fillRect(rect, QColor("#fbfbdb"))
+
+        # Hitung step grid dinamis
+        grid_step, zoom_scale = self._calculate_dynamic_step(target_px=50)
+        major_step = grid_step * 5
+
+        # Hitung rentang garis
+        left = math.floor(rect.left() / grid_step) * grid_step
+        top = math.floor(rect.top() / grid_step) * grid_step
+        right = rect.right()
+        bottom = rect.bottom()
+
+        pen_minor = QPen(QColor("#eae3b5"), 0, Qt.SolidLine)
+        pen_major = QPen(QColor("#dcd295"), 0, Qt.SolidLine)
+        pen_axis = QPen(QColor("#a8b3cb"), 0, Qt.SolidLine)
+
+        # Garis Vertikal
+        x = left
+        while x <= right:
+            # Gunakan math.isclose untuk cek kelipatan major (menghindari error floating point)
+            is_major = math.isclose((x / major_step) % 1.0, 0, abs_tol=1e-5) or math.isclose(x, 0, abs_tol=1e-5)
+            painter.setPen(pen_major if is_major else pen_minor)
+            painter.drawLine(QPointF(x, bottom), QPointF(x, top))
+            x += grid_step
+
+        # Garis Horizontal
+        y = top
+        while y <= bottom:
+            is_major = math.isclose((y / major_step) % 1.0, 0, abs_tol=1e-5) or math.isclose(y, 0, abs_tol=1e-5)
+            painter.setPen(pen_major if is_major else pen_minor)
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+            y += grid_step
+
+        # Sumbu Utama X=0 & Y=0
+        painter.setPen(pen_axis)
+        painter.drawLine(QPointF(left, 0), QPointF(right, 0))
+        painter.drawLine(QPointF(0, bottom), QPointF(0, top))
+
+        # Crosshair Origin (0,0)
+        pen_cross = QPen(QColor("blue"), 2 / zoom_scale)
+        painter.setPen(pen_cross)
+        size = 12 / zoom_scale
+        painter.drawLine(QPointF(-size, 0), QPointF(size, 0))
+        painter.drawLine(QPointF(0, -size), QPointF(0, size))
+
+    def drawForeground(self, painter, rect):
+        painter.save()
+        painter.setWorldTransform(QTransform())
+
+        vw = self.viewport().width()
+        vh = self.viewport().height()
+
+        margin = 40
+        font = QFont("Consolas", 7)
+        painter.setFont(font)
+
+        # Background Ruler (Kiri & Bawah)
+        painter.fillRect(0, 0, margin, vh, QColor("#fbfbdb"))
+        painter.fillRect(0, vh - margin, vw, margin, QColor("#fbfbdb"))
+
+        pen_text = QPen(QColor("#333333"))
+        painter.setPen(pen_text)
+        painter.drawText(10, vh - 12, "mm")
+
+        # --- A. RULER X & Y DYNAMIC SCALE ---
+        # Hitung step ideal untuk label teks angka (jarak antar angka idealnya ~80px)
+        step_val, _ = self._calculate_dynamic_step(target_px=80)
+
+        # --- A. RULER X (BAGIAN BAWAH) ---
+        start_pt = self.mapToScene(margin, 0)
+        end_pt = self.mapToScene(vw, 0)
+
+        first_x = math.floor(start_pt.x() / step_val) * step_val
+        curr_x = first_x
+        while curr_x <= end_pt.x():
+            target_px = self.mapFromScene(QPointF(curr_x, 0)).x()
+            if margin <= target_px <= vw:
+                painter.drawLine(int(target_px), vh - margin, int(target_px), vh - margin + 5)
+                
+                txt_val = f"{curr_x:.1f}" if step_val < 1 else f"{int(round(curr_x))}"
+                painter.drawText(int(target_px) - 30, vh - margin + 8, 60, 20, Qt.AlignCenter, txt_val)
+            curr_x += step_val
+
+        # --- B. RULER Y (BAGIAN KIRI) ---
+        start_y_pt = self.mapToScene(0, vh - margin)
+        end_y_pt = self.mapToScene(0, 0)
+
+        first_y = math.floor(start_y_pt.y() / step_val) * step_val
+        curr_y = first_y
+        while curr_y <= end_y_pt.y():
+            target_px = self.mapFromScene(QPointF(0, curr_y)).y()
+            if 0 <= target_px <= vh - margin:
+                painter.drawLine(margin - 5, int(target_px), margin, int(target_px))
+                
+                txt_val = f"{curr_y:.1f}" if step_val < 1 else f"{int(round(curr_y))}"
+                painter.drawText(0, int(target_px) - 10, margin - 8, 20, Qt.AlignRight | Qt.AlignVCenter, txt_val)
+            curr_y += step_val
+
+        # --- OVERLAY STATUS ZOOM & PTR (Pojok Kanan Atas) ---
+        box_w, box_h = 160, 45
+        box_x = vw - box_w - 15
+        box_y = 15
+
+        painter.setBrush(QBrush(QColor(230, 230, 220, 180)))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(box_x, box_y, box_w, box_h, 6, 6)
+
+        painter.setPen(pen_text)
+        
+        # Hitung persentase Zoom Scale
+        zoom_pct = int(round(abs(self.transform().m11()) * 100))
+    
+        # Baris 1: Pointer Coordinates (PTR)
+        painter.drawText(box_x + 10, box_y + 18, "PTR")
+        painter.drawText(box_x + 60, box_y + 18, f"{self.cursor_pos.x():8.3f}")
+        painter.drawText(box_x + 110, box_y + 18, f"{self.cursor_pos.y():8.3f}")
+
+        # Baris 2: Zoom Scale (%)
+        painter.drawText(box_x + 10, box_y + 36, "Zoom")
+        painter.drawText(box_x + 60, box_y + 36, f"{zoom_pct}%")
+
+        # Overlay Basic Usage (Pojok Kanan Bawah)
+        info_w, info_h = 240, 110
+        info_x = vw - info_w - 15
+        info_y = vh - info_h - margin - 15
+
+        painter.setBrush(QBrush(QColor(230, 230, 220, 180)))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(info_x, info_y, info_w, info_h, 6, 6)
+
+        painter.setPen(pen_text)
+        lines = [
+            "Basic usage",
+            "ZOOM: Use mouse wheel (or two-finger gesture)",
+            "PAN:  Click and drag (or touch and drag)",
+            "",
+            "Keyboard Shortcuts",
+            "Ctrl A: Zoom Auto  (100%)",
+            "Ctrl +: Zoom In    (+10%)",
+            "Ctrl -: Zoom Out   (-10%)"
+        ]
+        curr_y = info_y + 14
+        for line in lines:
+            font.setBold("Basic usage" in line or "Keyboard Shortcuts" in line)
+            painter.setFont(font)
+            painter.drawText(info_x + 10, curr_y, line)
+            curr_y += 12
+
+        painter.restore()
+
+    def plot_data(self, parsed_shapes):
+        """Memetakan geometri solid (Desain)"""
+        self.scene.clear()
+        if not parsed_shapes:
+            return
+
+        pen_shape = QPen(QColor("#B22222"), 0) # Merah Bata
+        brush_shape = QBrush(QColor(178, 34, 34, 180))
+
+        for item in parsed_shapes:
+            shape_type = item[0] if isinstance(item, tuple) else type(item).__name__
+            data = item[1] if isinstance(item, tuple) else None
+
+            if shape_type == 'CIRCLE':
+                center, radius = data
+                self.scene.addEllipse(
+                    center[0] - radius, center[1] - radius,
+                    radius * 2, radius * 2, pen_shape, brush_shape
+                )
+            elif shape_type == 'POLYGON':
+                pts = data
+                if len(pts) >= 3:
+                    path = QPainterPath()
+                    path.moveTo(pts[0][0], pts[0][1])
+                    for p in pts[1:]:
+                        path.lineTo(p[0], p[1])
+                    path.closeSubpath()
+                    self.scene.addPath(path, pen_shape, brush_shape)
+            elif shape_type == 'LINE':
+                pts = data
+                if len(pts) >= 2:
+                    path = QPainterPath()
+                    path.moveTo(pts[0][0], pts[0][1])
+                    for p in pts[1:]:
+                        path.lineTo(p[0], p[1])
+                    self.scene.addPath(path, pen_shape)
+
+        if not self.scene.itemsBoundingRect().isEmpty():
+            self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+
+    def plot_toolpaths(self, toolpaths):
+        """Memetakan jalur pemotongan Laser (Toolpaths)"""
+        self.scene.clear()
+        if not toolpaths:
+            return
+
+        path_cutting = QPainterPath()
+        pen_g1 = QPen(QColor("#0000FF"), 0) # Biru Laser Path
+
+        for path in toolpaths:
+            if len(path) >= 2:
+                path_cutting.moveTo(path[0][0], path[0][1])
+                for pt in path[1:]:
+                    path_cutting.lineTo(pt[0], pt[1])
+
+        self.scene.addPath(path_cutting, pen_g1)
+
+        if not self.scene.itemsBoundingRect().isEmpty():
+            self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+
+
+# ==============================================================================
+# HELPER FUNCTIONS & DIALOGS
+# ==============================================================================
 def scan_dxf_layers(filepath):
     doc = ezdxf.readfile(filepath)
     msp = doc.modelspace()
@@ -85,11 +478,9 @@ def scan_brd_layers(filepath):
         if num and name: layer_map[num] = name
 
     for elem in root.iter():
-        # Deteksi Objek
         if elem.tag in ['wire', 'pad', 'via', 'smd', 'polygon', 'circle', 'text']:
             object_counts[elem.tag] += 1
 
-        # Pemetaan Layer
         if 'layer' in elem.attrib:
             num = elem.attrib['layer']
             name = layer_map.get(num, f"Layer_{num}")
@@ -116,7 +507,7 @@ _LAYER_DEFAULT_EXCLUDE_KEYWORDS = (
 
 
 class LayerSelectionDialog(QDialog):
-    def __init__(self, layer_counts, object_counts=None, parent=None):
+    def __init__(self, layer_counts, object_counts=None, selected_layers=None, selected_objects=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pilih Layer & Objek")
         self.resize(450, 550)
@@ -135,7 +526,13 @@ class LayerSelectionDialog(QDialog):
         self.layer_cbs = {}
         for lname in sorted(layer_counts.keys()):
             cb = QCheckBox(f"{lname} ({layer_counts[lname]})")
-            cb.setChecked(not any(kw in lname.lower() for kw in _LAYER_DEFAULT_EXCLUDE_KEYWORDS))
+            
+            # Jika ada state sebelumnya, pakai state tersebut. Jika belum, pakai default keyword filter
+            if selected_layers is not None:
+                cb.setChecked(lname in selected_layers)
+            else:
+                cb.setChecked(not any(kw in lname.lower() for kw in _LAYER_DEFAULT_EXCLUDE_KEYWORDS))
+                
             l_layer.addWidget(cb)
             self.layer_cbs[lname] = cb
             
@@ -151,7 +548,13 @@ class LayerSelectionDialog(QDialog):
             obj_layout = QVBoxLayout(obj_box)
             for obj_name in sorted(object_counts.keys()):
                 cb = QCheckBox(f"{obj_name.capitalize()} ({object_counts[obj_name]})")
-                cb.setChecked(obj_name != 'text') # Default: text tidak diproses
+                
+                # Mengingat centang objek sebelumnya
+                if selected_objects is not None:
+                    cb.setChecked(obj_name in selected_objects)
+                else:
+                    cb.setChecked(obj_name != 'text') # Default: text di-uncheck
+                    
                 obj_layout.addWidget(cb)
                 self.obj_cbs[obj_name] = cb
             splitter.addWidget(obj_box)
@@ -164,14 +567,17 @@ class LayerSelectionDialog(QDialog):
         layout.addWidget(buttons)
 
     def get_included_layers(self):
-        inc = [n for n, cb in self.layer_cbs.items() if cb.isChecked()]
-        return inc if len(inc) < len(self.layer_cbs) else None
+        # Kembalikan semua layer yang dicentang
+        return [n for n, cb in self.layer_cbs.items() if cb.isChecked()]
 
     def get_included_objects(self):
         if not self.obj_cbs: return None
-        inc = [n for n, cb in self.obj_cbs.items() if cb.isChecked()]
-        return inc if len(inc) < len(self.obj_cbs) else None
+        return [n for n, cb in self.obj_cbs.items() if cb.isChecked()]
 
+
+# ==============================================================================
+# PARSER WORKER THREAD
+# ==============================================================================
 class ParserWorkerThread(QThread):
     finished = pyqtSignal(list, str, list)
     error = pyqtSignal(str)
@@ -197,7 +603,6 @@ class ParserWorkerThread(QThread):
             raw_geometries = []
             ext = self.filepath.lower().split('.')[-1]
 
-            # 1. Fase Pembacaan Murni (Viewer Mode)
             if ext == 'dxf':
                 self._parse_dxf(raw_geometries, max_error)
             elif ext == 'brd':
@@ -222,7 +627,6 @@ class ParserWorkerThread(QThread):
                 self.error.emit("Tidak ada entitas geometri yang berhasil diekstrak!")
                 return
 
-            # 2. Fase Adding The Rule (Hanya jalan jika DRL dicentang)
             cleaned_geometries = []
             if HAS_SHAPELY and self.config.get("use_drl_rules", False):
                 try:
@@ -294,7 +698,6 @@ class ParserWorkerThread(QThread):
             if not cleaned_geometries:
                 cleaned_geometries = raw_geometries
 
-            # 3. Fase G-Code Parsing
             parsed_shapes = []
             
             if laser_mode == 0:  
@@ -385,6 +788,7 @@ class ParserWorkerThread(QThread):
             if not parsed_shapes:
                 parsed_shapes = raw_geometries
 
+            parsed_shapes = self._normalize_to_origin(parsed_shapes)
             gcode_str, toolpaths = self.generate_hatching_gcode(parsed_shapes, self.config, laser_mode)
             self.finished.emit(parsed_shapes, gcode_str, toolpaths)
 
@@ -395,7 +799,6 @@ class ParserWorkerThread(QThread):
         import builtins
         _original_open = builtins.open
         
-        # Fungsi pencegat untuk memanipulasi mode pembacaan file dari 'rU' menjadi 'r'
         def _safe_open(*args, **kwargs):
             if len(args) > 1 and args[1] == 'rU':
                 args = list(args)
@@ -406,14 +809,11 @@ class ParserWorkerThread(QThread):
             return _original_open(*args, **kwargs)
 
         try:
-            # Patch builtins.open sementara untuk menambal bug pcb-tools di Python 3.11+
             builtins.open = _safe_open
             cam = gerber.read(self.filepath)
-            builtins.open = _original_open # Kembalikan ke aslinya
+            builtins.open = _original_open
+            cam.to_metric()
             
-            cam.to_metric() # Paksa satuan milimeter
-            
-            # Fungsi bantuan untuk menghaluskan lengkungan Arc (interpolasi sudut)
             def get_arc_points(start, end, center, direction, num_points=16):
                 cx, cy = center
                 sx, sy = start
@@ -425,7 +825,7 @@ class ParserWorkerThread(QThread):
                 if direction == 'counterclockwise':
                     if angle_end <= angle_start:
                         angle_end += 2 * math.pi
-                else: # clockwise
+                else:
                     if angle_end >= angle_start:
                         angle_start += 2 * math.pi
                         
@@ -442,7 +842,6 @@ class ParserWorkerThread(QThread):
             for prim in cam.primitives:
                 p_type = type(prim).__name__
                 
-                # 1. Parsing Jalur (Line/Tracks)
                 if p_type == 'Line':
                     p1, p2 = prim.start, prim.end
                     width = 0
@@ -457,21 +856,18 @@ class ParserWorkerThread(QThread):
                     else:
                         raw_geometries.append(('LINE', [p1, p2]))
                 
-                # 2. Parsing Pad Bulat / Vias
                 elif p_type == 'Circle':
                     center = prim.position
                     radius = getattr(prim, 'radius', getattr(prim, 'diameter', 0) / 2.0)
                     if radius > 0:
                         raw_geometries.append(('CIRCLE', (center, radius)))
                         
-                # 3. Parsing Pad Kotak (SMD)
                 elif p_type == 'Rectangle':
                     x, y = prim.position
                     w, h = prim.width, prim.height
                     pts = [(x-w/2, y-h/2), (x+w/2, y-h/2), (x+w/2, y+h/2), (x-w/2, y+h/2)]
                     raw_geometries.append(('POLYGON', pts))
                     
-                # 4. Parsing Pad Kapsul (Obround)
                 elif p_type == 'Obround':
                     x, y = prim.position
                     w, h = prim.width, prim.height
@@ -488,7 +884,6 @@ class ParserWorkerThread(QThread):
                         pts = [(x-w/2, y-h/2), (x+w/2, y-h/2), (x+w/2, y+h/2), (x-w/2, y+h/2)]
                         raw_geometries.append(('POLYGON', pts))
                         
-                # 5. Parsing Area Tembaga Lebar (Regions / Polygons)
                 elif p_type == 'Region':
                     pts = []
                     for b_prim in prim.primitives:
@@ -499,11 +894,10 @@ class ParserWorkerThread(QThread):
                         elif b_type == 'Arc':
                             arc_pts = get_arc_points(b_prim.start, b_prim.end, b_prim.center, b_prim.direction)
                             if not pts: pts.extend(arc_pts)
-                            else: pts.extend(arc_pts[1:]) # Hindari titik ganda (overlap)
+                            else: pts.extend(arc_pts[1:])
                     if len(pts) >= 3:
                         raw_geometries.append(('POLYGON', pts))
 
-                # 6. Parsing Jalur Melengkung (Standalone Arcs)
                 elif p_type == 'Arc':
                     width = 0
                     if hasattr(prim, 'aperture') and prim.aperture:
@@ -549,7 +943,6 @@ class ParserWorkerThread(QThread):
                 if included_layers is None or lname in included_layers:
                     valid = True
                 
-                # Logika ekstraksi SMD untuk Solder Mask & Paste Mask
                 if item.tag == 'smd' and included_layers is not None:
                     tstop = layer_map.get('29', 'tStop')
                     tcream = layer_map.get('31', 'tCream')
@@ -568,7 +961,6 @@ class ParserWorkerThread(QThread):
                         diag["layers_excluded"][lname] += 1
                     
             else:
-                # Logika tembus layer untuk Pad dan Via
                 if item.tag in ['pad', 'via']:
                     if included_layers is None:
                         valid = True
@@ -808,7 +1200,7 @@ class ParserWorkerThread(QThread):
         max_error = config.get("flattening_max_error", 0.01)
 
         gcode = []
-        gcode.append("; --- Generated by Sculpfun PCB High-Precision Laser Parser ---")
+        gcode.append("; --- Generated by LoGoRo Laser Parser ---")
         gcode.append(f"; Mode: {['Isolation Routing', 'Full Hatching', 'Negative Clearance'][laser_mode]}")
         gcode.append(f"; Precision: {max_error} mm | Spot Size: {spot_size} mm")
         gcode.append("G21 ; Millimeters")
@@ -894,77 +1286,54 @@ class ParserWorkerThread(QThread):
 
         return "\n".join(gcode), toolpaths
 
+    def _normalize_to_origin(self, geometries):
+        """Menggeser seluruh geometri agar titik kiri-bawah tepat di (0,0)"""
+        min_x = float('inf')
+        min_y = float('inf')
 
-class FastPlotCanvas(FigureCanvas):
-    def __init__(self, parent=None, title="High Precision PCB Solid View"):
-        fig = Figure(dpi=100) 
-        self.axes = fig.add_subplot(111)
-        self.title = title
-        super().__init__(fig)
-        self.setParent(parent)
-
-    def plot_data(self, parsed_shapes, fill_color='red'):
-        self.axes.clear()
-        self.axes.set_title(self.title, fontsize=10, fontweight='bold')
-        self.axes.set_xlabel("X (mm)")
-        self.axes.set_ylabel("Y (mm)")
-        self.axes.grid(True, linestyle='--', alpha=0.3)
-        self.axes.set_aspect('equal', adjustable='box')
-
-        patches = []
-        lines = []
-
-        for shape_type, data in parsed_shapes:
+        # 1. Cari titik terkecil (min_x, min_y)
+        for item in geometries:
+            shape_type, data = item
             if shape_type == 'CIRCLE':
                 center, radius = data
-                patches.append(MplCircle(center, radius))
-            elif shape_type == 'POLYGON':
-                pts = data
-                patches.append(MplPolygon(pts, closed=True))
-            elif shape_type == 'LINE':
-                lines.append(data)
+                min_x = min(min_x, center[0] - radius)
+                min_y = min(min_y, center[1] - radius)
+            elif shape_type in ('POLYGON', 'LINE'):
+                for x, y in data:
+                    min_x = min(min_x, x)
+                    min_y = min(min_y, y)
 
-        if patches:
-            pc = PatchCollection(patches, facecolors=fill_color, edgecolors='none', linewidth=0, alpha=0.9, antialiased=False)
-            self.axes.add_collection(pc)
+        if min_x == float('inf') or min_y == float('inf'):
+            return geometries
 
-        if lines:
-            lc = LineCollection(lines, colors=fill_color, linewidths=1.2, antialiased=False)
-            self.axes.add_collection(lc)
+        # 2. Translasikan seluruh titik dikurangi min_x dan min_y
+        normalized = []
+        for item in geometries:
+            shape_type, data = item
+            if shape_type == 'CIRCLE':
+                center, radius = data
+                new_center = (center[0] - min_x, center[1] - min_y)
+                normalized.append(('CIRCLE', (new_center, radius)))
+            elif shape_type in ('POLYGON', 'LINE'):
+                new_pts = [(x - min_x, y - min_y) for x, y in data]
+                normalized.append((shape_type, new_pts))
 
-        self.axes.autoscale()
-        self.figure.tight_layout() 
-        self.draw()
-        
-    def plot_toolpaths(self, toolpaths, line_color='blue'):
-        self.axes.clear()
-        self.axes.set_title("G-Code Toolpath View", fontsize=10, fontweight='bold')
-        self.axes.set_xlabel("X (mm)")
-        self.axes.set_ylabel("Y (mm)")
-        self.axes.grid(True, linestyle='--', alpha=0.3)
-        self.axes.set_aspect('equal', adjustable='box')
-
-        lines = []
-        for path in toolpaths:
-            if len(path) > 1:
-                lines.append(path)
-
-        if lines:
-            lc = LineCollection(lines, colors=line_color, linewidths=0.6, antialiased=False)
-            self.axes.add_collection(lc)
-
-        self.axes.autoscale()
-        self.figure.tight_layout() 
-        self.draw()
+        return normalized
 
 
+# ==============================================================================
+# MAIN WINDOW APPLICATION
+# ==============================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sculpfun C1 Mini - Multi-Format (DXF/BRD/GBR/PNG/SVG) to PCB G-Code")
         self.resize(1250, 850)
 
+        self.is_auto_process = False
+
         self.current_parsed_shapes = []
+        self.current_toolpaths = []
         self.filepath = ""
         self.worker = None
         self.layer_config = {"included_layers": None, "outline_layer": "AUTO"}
@@ -979,20 +1348,22 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
+        # --- LEFT PANEL (SETTINGS & G-CODE EDITOR) ---
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
 
-        config_box = QGroupBox("Configuration: Sculpfun C1 Mini")
+        config_box = QGroupBox("Config Panel")
         config_grid = QGridLayout(config_box)
 
         config_grid.addWidget(QLabel("Laser Working Mode"), 0, 0)
         self.combo_mode = QComboBox()
         self.combo_mode.addItems([
-            "0: Isolation Routing (Parit/Cepat)", 
-            "1: Full Hatching (Arsir Penuh)", 
-            "2: Negative Clearance (Area Kosong)"
+            "Isolation Routing (Parit/Cepat)", 
+            "Full Hatching (Arsir Penuh)", 
+            "Negative Clearance (Area Kosong)"
         ])
         config_grid.addWidget(self.combo_mode, 0, 1)
+        self.combo_mode.currentIndexChanged.connect(self.auto_convert_gcode)
 
         self.inputs = {}
         default_config = [
@@ -1022,7 +1393,6 @@ class MainWindow(QMainWindow):
         
         drl_layout.addWidget(self.chk_drl)
         drl_layout.addWidget(self.btn_check_drl)
-        
         config_grid.addLayout(drl_layout, row, 0, 1, 2)
 		
         left_layout.addWidget(config_box)
@@ -1049,17 +1419,27 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(btn_layout)
         
         self.phase_inputs = [] 
+        # --- LASER PHASES WINDOW ---
         phases_group = QGroupBox("Laser Phases (Passes)")
-        self.phases_layout = QVBoxLayout(phases_group)
-        
+        phases_outer_layout = QVBoxLayout(phases_group)
+        self.phases_content_widget = QWidget()
+        self.phases_layout = QVBoxLayout(self.phases_content_widget)
+        self.phases_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_phases = QScrollArea()
+        scroll_phases.setWidgetResizable(True)
+        scroll_phases.setWidget(self.phases_content_widget)
+        scroll_phases.setMaximumHeight(120) 
+        scroll_phases.setFrameShape(QScrollArea.NoFrame) 
         self.btn_tambah_phase = QPushButton("➕ Tambah Phase")
         self.btn_tambah_phase.setStyleSheet("background-color: #2980b9; color: white;")
         self.btn_tambah_phase.clicked.connect(self.add_phase)
-        self.phases_layout.addWidget(self.btn_tambah_phase)
-        
-        self.add_phase("700") 
-                
-        left_layout.addWidget(config_box)
+
+        phases_outer_layout.addWidget(scroll_phases)
+        phases_outer_layout.addWidget(self.btn_tambah_phase)
+
+        self.phase_inputs = []
+        self.add_phase("700")
+
         left_layout.addWidget(phases_group) 
 
         editor_box = QGroupBox("G-Code Preview")
@@ -1071,28 +1451,36 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(editor_box)
         splitter.addWidget(left_panel)
 
+        # --- RIGHT PANEL (PyQt5 GCodeCanvas Visualizer) ---
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
         preview_layout = QHBoxLayout()
         preview_layout.addWidget(QLabel("Preview Mode:"))
         self.combo_preview = QComboBox()
-        self.combo_preview.addItems(["1. Design (Solid Area)", "2. G-Code (Laser Toolpaths)"])
+        self.combo_preview = QComboBox()
+        self.combo_preview.addItems([
+            "Design (Solid Area)", 
+            "G-Code (Laser Toolpaths)", 
+            "ALL G-Code "
+        ])
         self.combo_preview.currentIndexChanged.connect(self.update_preview)
         preview_layout.addWidget(self.combo_preview)
         preview_layout.addStretch()
         right_layout.addLayout(preview_layout)
 
-        canvas_container = QWidget()
-        canvas_vbox = QVBoxLayout(canvas_container)
-        self.canvas = FastPlotCanvas(self, title="Geometry Solid View")
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        canvas_vbox.addWidget(self.toolbar)
-        canvas_vbox.addWidget(self.canvas)
-        right_layout.addWidget(canvas_container)
+        # Penggantian FastPlotCanvas dengan GCodeCanvas
+        self.canvas = GCodeCanvas(self)
+        right_layout.addWidget(self.canvas)
 
         splitter.addWidget(right_panel)
         splitter.setSizes([450, 800])
+
+    def auto_convert_gcode(self):
+        """Memicu konversi tanpa menampilkan QMessageBox success"""
+        if self.filepath:
+            self.is_auto_process = True
+            self.convert_file_to_gcode()
         
     def add_phase(self, default_power=False):
         if not isinstance(default_power, str):
@@ -1100,15 +1488,46 @@ class MainWindow(QMainWindow):
 
         phase_index = len(self.phase_inputs) + 1
         
-        row_layout = QHBoxLayout()
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        
         lbl = QLabel(f"Phase {phase_index} Power (S):")
         inp = QLineEdit(default_power)
         
+        btn_del = QPushButton("🗑️")
+        btn_del.setFixedWidth(30)
+        btn_del.setStyleSheet("color: red;")
+        btn_del.clicked.connect(lambda: self.remove_phase(row_widget, inp))
+        
         row_layout.addWidget(lbl)
         row_layout.addWidget(inp)
+        row_layout.addWidget(btn_del)
         
-        self.phases_layout.insertLayout(self.phases_layout.count() - 1, row_layout)
+        self.phases_layout.addWidget(row_widget)
         self.phase_inputs.append(inp)
+
+        if hasattr(self, 'filepath') and self.filepath:
+            self.auto_convert_gcode()
+
+    def remove_phase(self, row_widget, inp):
+        if len(self.phase_inputs) <= 1:
+            QMessageBox.warning(self, "Warning", "Minimal harus ada 1 Laser Phase!")
+            return
+
+        if inp in self.phase_inputs:
+            self.phase_inputs.remove(inp)
+            
+        row_widget.deleteLater()
+
+        for i, input_field in enumerate(self.phase_inputs):
+            parent_widget = input_field.parentWidget()
+            if parent_widget:
+                label = parent_widget.findChild(QLabel)
+                if label:
+                    label.setText(f"Phase {i + 1} Power (S):")
+
+        self.auto_convert_gcode()
 
     def get_config_dict(self):
         try:
@@ -1144,8 +1563,6 @@ class MainWindow(QMainWindow):
         is_layered_file = filepath.lower().endswith('.dxf') or filepath.lower().endswith('.brd')
         self.btn_layers.setEnabled(is_layered_file)
 
-        # File Gerber biasanya hanya terdiri dari 1 layer per file (Top saja atau Bottom saja),
-        # sehingga tidak butuh Dialog Pemilihan Layer. Bisa langsung dikonversi!
         if is_layered_file:
             if not self._prompt_layer_selection(filepath):
                 return
@@ -1167,10 +1584,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Tidak ada entitas ber-layer yang ditemukan di dalam file ini.")
             return False
 
-        dialog = LayerSelectionDialog(layer_counts, object_counts, self)
+        # Ambil state terlampir jika ada
+        curr_layers = self.layer_config.get("included_layers")
+        curr_objs = self.layer_config.get("included_objects")
+
+        # Pass curr_layers & curr_objs ke dialog
+        dialog = LayerSelectionDialog(layer_counts, object_counts, curr_layers, curr_objs, self)
         if dialog.exec_() != QDialog.Accepted:
             return False
 
+        # Simpan hasil pilihan baru ke layer_config
         self.layer_config = {
             "included_layers": dialog.get_included_layers(),
             "included_objects": dialog.get_included_objects(),
@@ -1225,7 +1648,6 @@ class MainWindow(QMainWindow):
         for i in range(total_geoms):
             for j in range(i + 1, total_geoms):
                 dist = shapely_geoms[i].distance(shapely_geoms[j])
-                
                 if 0.001 < dist < min_clearance:
                     violations += 1
 
@@ -1270,25 +1692,28 @@ class MainWindow(QMainWindow):
         is_layered_file = self.filepath.lower().endswith('.dxf') or self.filepath.lower().endswith('.brd')
         self.btn_layers.setEnabled(is_layered_file)
         self.btn_convert.setEnabled(True)
-        self.btn_convert.setText("2. Convert G-Code")
+        self.btn_convert.setText("Convert G-Code")
 
-        summary = f"Berhasil memproses file!\nTotal Elemen Jalur: {len(self.current_parsed_shapes)}"
+        if not self.is_auto_process:
+            summary = f"Berhasil memproses file!\nTotal Elemen Jalur: {len(self.current_parsed_shapes)}"
 
-        diag = getattr(self.worker, "diagnostics", None) if self.worker else None
-        if diag and diag.get("layers_seen"):
-            summary += "\n\n--- Rincian Layer Terdeteksi ---"
-            for layer_name in sorted(diag["layers_seen"].keys()):
-                seen = diag["layers_seen"][layer_name]
-                included = diag["layers_included"].get(layer_name, 0)
-                excluded = diag["layers_excluded"].get(layer_name, 0)
-                if excluded:
-                    summary += f"\n{layer_name}: {seen} entitas (dilewati/di-filter)"
-                else:
-                    summary += f"\n{layer_name}: {seen} entitas ({included} terpakai)"
-            if diag.get("parse_errors"):
-                summary += f"\nEntitas gagal dibaca: {diag['parse_errors']}"
+            diag = getattr(self.worker, "diagnostics", None) if self.worker else None
+            if diag and diag.get("layers_seen"):
+                summary += "\n\n--- Rincian Layer Terdeteksi ---"
+                for layer_name in sorted(diag["layers_seen"].keys()):
+                    seen = diag["layers_seen"][layer_name]
+                    included = diag["layers_included"].get(layer_name, 0)
+                    excluded = diag["layers_excluded"].get(layer_name, 0)
+                    if excluded:
+                        summary += f"\n{layer_name}: {seen} entitas (dilewati/di-filter)"
+                    else:
+                        summary += f"\n{layer_name}: {seen} entitas ({included} terpakai)"
+                if diag.get("parse_errors"):
+                    summary += f"\nEntitas gagal dibaca: {diag['parse_errors']}"
 
-        QMessageBox.information(self, "Success", summary)
+            QMessageBox.information(self, "Success", summary)
+        
+        self.is_auto_process = False
 
     def on_processing_error(self, err_msg):
         self.btn_open.setEnabled(True)
@@ -1318,12 +1743,15 @@ class MainWindow(QMainWindow):
     def update_preview(self):
         idx = self.combo_preview.currentIndex()
         if idx == 0:
-            self.canvas.plot_data(self.current_parsed_shapes, fill_color='red')
+            self.canvas.plot_data(self.current_parsed_shapes)
         elif idx == 1:
             if hasattr(self, 'current_toolpaths') and self.current_toolpaths:
-                self.canvas.plot_toolpaths(self.current_toolpaths, line_color='blue')
+                self.canvas.plot_toolpaths(self.current_toolpaths)
             else:
-                self.canvas.plot_toolpaths([]) 
+                self.canvas.plot_toolpaths([])
+        elif idx == 2:
+            gcode_text = self.gcode_editor.toPlainText()
+            self.canvas.plot_all_gcode(gcode_text)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
