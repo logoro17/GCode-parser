@@ -25,6 +25,12 @@ try:
 except ImportError:
     HAS_GERBER = False
 
+try:
+    from auditor import GCodeAuditorWidget
+    HAS_AUDITOR = True
+except ImportError:
+    HAS_AUDITOR = False
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog, 
@@ -1286,7 +1292,7 @@ class ParserWorkerThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sculpfun C1 Mini - Multi-Format PCB Suite")
+        self.setWindowTitle("GCode Parser - Multi-Format PCB Suite")
         self.resize(1250, 850)
 
         self.is_auto_process = False
@@ -1325,10 +1331,15 @@ class MainWindow(QMainWindow):
         self.init_simulator_ui(self.page_simulator)
         self.stacked_widget.addWidget(self.page_simulator)
 
+        # Halaman 3: G-Code Auditor (BARU)
+        if HAS_AUDITOR:
+            self.page_auditor = GCodeAuditorWidget(GCodeCanvas, self)
+            self.stacked_widget.addWidget(self.page_auditor)
+
         self.setup_toolbars()
 
     def setup_toolbars(self):
-        # --- BARIS 1: TOOLBAR AKSI UTAMA (KOTAK MERAH) ---
+        # --- BARIS 1: TOOLBAR AKSI UTAMA ---
         action_bar = QToolBar("Action Toolbar")
         action_bar.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, action_bar)
@@ -1353,18 +1364,79 @@ class MainWindow(QMainWindow):
         # PINDAH KE BARIS BAWAHNYA
         self.addToolBarBreak(Qt.TopToolBarArea)
 
-        # --- BARIS 2: TOOLBAR NAVIGASI TAB (KOTAK HIJAU) ---
-        nav_bar = QToolBar("Navigation Toolbar")
-        nav_bar.setMovable(False)
-        self.addToolBar(Qt.TopToolBarArea, nav_bar)
+        # --- BARIS 2: TOOLBAR NAVIGASI TAB ---
+        self.nav_bar = QToolBar("Navigation Toolbar")
+        self.nav_bar.setMovable(False)
+        
+        # Berikan styling QSS agar tombol yang di-hover / aktif memiliki background abu-abu
+        self.nav_bar.setStyleSheet("""
+            QToolBar QToolButton {
+                padding: 6px 12px;
+                margin: 2px;
+                border-radius: 4px;
+                font-weight: bold;
+                qproperty-toolTip: "";
+            }
+            QToolBar QToolButton:hover {
+                background-color: #e0e0e0;
+            }
+            QToolTip {
+                font-size: 0px;
+                width: 0px;
+                height: 0px;
+                background-color: transparent;
+                border: none;
+            }
+        """)
+        self.addToolBar(Qt.TopToolBarArea, self.nav_bar)
 
-        act_p1 = QAction("🔌 PCB Generator", self)
-        act_p1.triggered.connect(lambda: self.stacked_widget.setCurrentIndex(0))
-        nav_bar.addAction(act_p1)
+        self.act_p1 = QAction("🔌 Generator", self)
+        self.act_p1.setToolTip("")
+        self.act_p1.triggered.connect(lambda: self.switch_page(0))
+        self.nav_bar.addAction(self.act_p1)
 
-        act_p2 = QAction("▶️ G-Code Simulator", self)
-        act_p2.triggered.connect(lambda: self.stacked_widget.setCurrentIndex(1))
-        nav_bar.addAction(act_p2)
+        self.act_p2 = QAction("▶️ Simulator", self)
+        self.act_p2.setToolTip("")
+        self.act_p2.triggered.connect(lambda: self.switch_page(1))
+        self.nav_bar.addAction(self.act_p2)
+
+        if HAS_AUDITOR:
+            self.act_p3 = QAction("📊 Inspector", self)
+            self.act_p3.setToolTip("")
+            self.act_p3.triggered.connect(lambda: self.switch_page(2))
+            self.nav_bar.addAction(self.act_p3)
+
+        # Set highlight awal untuk halaman pertama (index 0)
+        self.update_nav_highlight(0)
+
+    def switch_page(self, index):
+        """Memindahkan halaman QStackedWidget sekaligus mengupdate warna tombol aktif"""
+        self.stacked_widget.setCurrentIndex(index)
+        
+        # Jika pindah ke Halaman Audit (index 2), jalankan auto-process
+        if index == 2 and HAS_AUDITOR:
+            gcode_text = self.gcode_editor.toPlainText()
+            if gcode_text.strip():
+                lines = gcode_text.splitlines(True)
+                self.page_auditor.process_gcode(lines, "Active_Buffer.gcode")
+
+        self.update_nav_highlight(index)
+
+    def update_nav_highlight(self, active_index):
+        """Mengubah warna background tombol navigasi aktif menjadi abu-abu (#d6d6d6)"""
+        nav_actions = [self.act_p1, self.act_p2]
+        if HAS_AUDITOR:
+            nav_actions.append(self.act_p3)
+
+        for i, act in enumerate(nav_actions):
+            widget = self.nav_bar.widgetForAction(act)
+            if widget:
+                if i == active_index:
+                    # Halaman Aktif: Abu-abu agak gelap (#d6d6d6) + Border tipis
+                    widget.setStyleSheet("background-color: #d6d6d6; border: 1px solid #b0b0b0; border-radius: 4px;")
+                else:
+                    # Halaman Non-Aktif: Transparan (Kembali normal)
+                    widget.setStyleSheet("background-color: transparent; border: none;")
 
     def init_generator_ui(self, parent_widget):
         main_layout = QHBoxLayout(parent_widget)
@@ -1488,7 +1560,7 @@ class MainWindow(QMainWindow):
         right_control = QWidget()
         right_layout = QVBoxLayout(right_control)
 
-        lbl_title = QLabel("GRBL REAL-TIME CONTROLLER")
+        lbl_title = QLabel("CNC REAL-TIME SIMULATOR")
         lbl_title.setFont(QFont("Arial", 12, QFont.Bold))
         right_layout.addWidget(lbl_title)
 
@@ -1528,6 +1600,25 @@ class MainWindow(QMainWindow):
         self.sim_terminal = QTextEdit()
         self.sim_terminal.setReadOnly(True)
         self.sim_terminal.setStyleSheet("background-color: black; color: white; font-family: Consolas;")
+
+        # --- INITIAL TEXT SAAT PERTAMA KALI MASUK TAB ---
+        init_welcome_msg = (
+            "==========================================\n"
+            " CNC SIMULATOR v1.0 ONLINE\n"
+            "==========================================\n"
+            "Status  : Ready / Idle\n"
+            "Notice  : Klik 'Sync G-Code' atau tombol 'START'\n"
+            "          untuk memuat buffer G-Code terbaru.\n"
+            "------------------------------------------\n"
+            "> Waiting for G-Code input...\n"
+            "------------------------------------------\n"
+            "\n"
+            "\n"
+            "Simulator ini berjalan dengan memproses G-Code menurut FEED RATE dan Acceleration.\n"
+            "Silahkan Sesuaikan FeedRate (mm/min) dan Accel (mm/s^2) untuk mendapatkan waktu eksekusi teoritis.\n"
+        )
+        self.sim_terminal.setPlainText(init_welcome_msg)
+
         right_layout.addWidget(self.sim_terminal)
 
         splitter.addWidget(right_control)
@@ -1799,6 +1890,25 @@ class MainWindow(QMainWindow):
     # --- LOGIKA REAL-TIME SIMULATOR ---
     def sync_gcode_to_simulator(self):
         text = self.gcode_editor.toPlainText()
+        if not text.strip():
+            self.sim_lines = []
+            self.lbl_sim_status.setText("LOADED: 0 Lines")
+            self.lbl_sim_status.setStyleSheet("color: red;")
+            self.sim_terminal.setPlainText(
+                "==========================================\n"
+                " CNC REAL-TIME SIMULATOR\n"
+                "==========================================\n"
+                "[WARNING] Belum ada G-Code di Editor!\n"
+                "\n"
+                "\n"
+                "\n"
+                "\n"
+                "Simulator ini berjalan dengan memproses G-Code menurut FEED RATE dan Acceleration.\n"
+                "Silahkan Sesuaikan FeedRate (mm/min) dan Accel (mm/s^2) untuk mendapatkan waktu eksekusi teoritis.\n"
+            )
+            return
+
+        # Jika ada G-Code, muat seperti biasa
         self.sim_lines = [line.strip() for line in text.splitlines() if line.strip()]
         self.sim_terminal.setPlainText("\n".join(self.sim_lines))
         self.lbl_sim_status.setText(f"LOADED: {len(self.sim_lines)} Lines")
@@ -1896,6 +2006,16 @@ class MainWindow(QMainWindow):
         mils = int((self.sim_elapsed_time - int(self.sim_elapsed_time)) * 100)
         self.lbl_timer.setText(f"{mins:02}:{secs:02}.{mils:02}")
 
+    def switch_to_auditor(self):
+        if not HAS_AUDITOR:
+            QMessageBox.critical(self, "Error", "Modul auditor.py tidak ditemukan!")
+            return
+
+        self.stacked_widget.setCurrentIndex(2)
+        gcode_text = self.gcode_editor.toPlainText()
+        if gcode_text.strip():
+            lines = gcode_text.splitlines(True)
+            self.page_auditor.process_gcode(lines, "Active_Buffer.gcode")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

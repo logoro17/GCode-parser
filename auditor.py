@@ -1,68 +1,51 @@
-import tkinter as tk
-from tkinter import filedialog, scrolledtext
 import re
 import math
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+    QTextEdit, QSplitter, QGraphicsItem
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QPen, QColor, QPainterPath, QTransform
 
-class GCodeAuditorUltimate:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("G-Code Auditor: Ultimate Distance & Area Calculator (GRBL Compatible)")
-        self.root.geometry("1300x800")
 
-        # --- HEADER ---
-        top_frame = tk.Frame(root, bg="#102027", pady=10)
-        top_frame.pack(fill=tk.X)
-        
-        btn = tk.Button(top_frame, text="📂 LOAD G-CODE", command=self.load_file, 
-                        font=("Segoe UI", 11, "bold"), bg="#00E676", fg="black", width=20)
-        btn.pack(side=tk.LEFT, padx=20)
+class GCodeAuditorWidget(QWidget):
+    def __init__(self, canvas_class, parent=None):
+        super().__init__(parent)
 
-        # Label Header Real-time
-        self.lbl_info = tk.Label(top_frame, text="Ready.", bg="#102027", fg="#cfd8dc", font=("Consolas", 11))
-        self.lbl_info.pack(side=tk.LEFT, padx=10)
+        main_layout = QVBoxLayout(self)
 
-        # --- MAIN LAYOUT ---
-        main_frame = tk.Frame(root, bg="#eceff1")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Top Bar Status Info
+        top_layout = QHBoxLayout()
+        self.lbl_info = QLabel("Ready to Audit.")
+        self.lbl_info.setFont(QFont("Consolas", 11))
+        top_layout.addWidget(self.lbl_info)
+        top_layout.addStretch()
+        main_layout.addLayout(top_layout)
 
-        # KIRI: VISUALISASI
-        left_frame = tk.Frame(main_frame, bg="white", bd=2, relief=tk.RIDGE)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Main Splitter Layout
+        splitter = QSplitter(Qt.Horizontal)
 
-        self.fig, self.ax = plt.subplots(figsize=(6, 6))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=left_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, left_frame)
-        self.toolbar.update()
+        # Left: Native PyQt5 GCodeCanvas Visualizer
+        self.canvas = canvas_class(self)
+        splitter.addWidget(self.canvas)
 
-        # KANAN: TERMINAL DATA
-        right_frame = tk.Frame(main_frame, bg="#212121", width=480)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
-        right_frame.pack_propagate(False)
+        # Right: Detailed Terminal Log
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        lbl_report = QLabel("INSPECTION REPORT (DETAILED)")
+        lbl_report.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        right_layout.addWidget(lbl_report)
 
-        tk.Label(right_frame, text="AUDIT REPORT (DETAILED)", bg="#212121", fg="white", font=("Segoe UI", 10, "bold")).pack(pady=5)
-        
-        self.terminal = scrolledtext.ScrolledText(right_frame, width=40, font=("Consolas", 9), bg="#111", fg="#00ff00")
-        self.terminal.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Styling Terminal
-        self.terminal.tag_config("travel", foreground="#ff5252") # Merah
-        self.terminal.tag_config("cut", foreground="#69f0ae")    # Hijau
-        self.terminal.tag_config("header", foreground="white", font=("Consolas", 9, "bold"))
-        self.terminal.tag_config("total", foreground="#FFD700", font=("Consolas", 11, "bold")) # Emas
+        self.terminal = QTextEdit()
+        self.terminal.setReadOnly(True)
+        self.terminal.setStyleSheet("background-color: #111; color: #00ff00; font-family: Consolas;")
+        right_layout.addWidget(self.terminal)
 
-    def load_file(self):
-        path = filedialog.askopenfilename(filetypes=[("GCode", "*.gcode *.ngc *.nc *.txt")])
-        if not path: return
-        with open(path, 'r') as f: lines = f.readlines()
-        self.process_gcode(lines, path.split('/')[-1])
+        splitter.addWidget(right_widget)
+        splitter.setSizes([750, 450])
+        main_layout.addWidget(splitter)
 
-    # --- MATH & PARSING FUNCTIONS ---
     def get_params(self, line):
-        """Ekstraksi seluruh parameter G, M, X, Y, Z, I, J, F, S dari baris G-Code"""
         params = {}
         matches = re.findall(r'([GMXYZIJSF])\s*([-+]?[0-9]*\.?[0-9]+)', line)
         for char, val in matches:
@@ -103,41 +86,33 @@ class GCodeAuditorUltimate:
             points.append((px, py))
         return points
 
-    # --- MAIN LOGIC ---
     def process_gcode(self, lines, filename):
-        self.ax.clear()
-        self.ax.set_title(f"Audit: {filename}", fontsize=10, fontweight='bold')
-        self.ax.set_aspect('equal')
-        self.ax.grid(True, linestyle=':', alpha=0.3)
-        
-        self.terminal.delete(1.0, tk.END)
-        self.terminal.insert(tk.END, f"FILE: {filename}\n", "header")
-        self.terminal.insert(tk.END, "-"*50 + "\n", "header")
+        self.canvas.scene.clear()
+        self.terminal.clear()
+        self.terminal.append(f"FILE: {filename}\n" + "-"*40)
 
-        # --- STATE MESIN GRBL ---
         cx, cy, cz = 0.0, 0.0, 0.0
-        unit_scale = 1.0       # G21 = 1.0 (mm), G20 = 25.4 (inch)
-        is_relative = False    # G90 = Absolute, G91 = Relative
-        laser_spindle_on = False # Aktif jika M3/M4
-        active_g_mode = 0      # Modal command: 0 = G0 (Rapid), 1 = G1 (Linear), 2 = G2, 3 = G3
-        feedrate = 1000.0
-        spindle_power = 0.0
+        unit_scale = 1.0
+        is_relative = False
+        laser_spindle_on = False
+        active_g_mode = 0
         
         object_counter = 0
+        total_rapid_dist = 0.0
+        total_cut_dist = 0.0
         
-        # --- TOTAL ACCUMULATORS ---
-        total_rapid_dist = 0.0   # Jarak G0 (Merah)
-        total_cut_dist = 0.0     # Jarak G1/G2/G3 (Hitam)
-        
-        # Buffers
         current_poly_points = []
         current_block_xs = []; current_block_ys = []
         is_collecting_area = False 
         
-        # Segment Trackers
         travel_accumulated_dist = 0.0
         travel_start_pos = (0, 0)
         is_traveling = True 
+
+        path_cutting = QPainterPath()
+        path_travel = QPainterPath()
+        pen_g1 = QPen(QColor("black"), 0)
+        pen_g0 = QPen(QColor("#FF0000"), 0, Qt.DashLine)
 
         for line in lines:
             clean_line = line.split('(')[0].split(';')[0].strip().upper()
@@ -146,7 +121,6 @@ class GCodeAuditorUltimate:
             params = self.get_params(clean_line)
             if not params: continue
 
-            # 1. BACA / UPDATE SETTING MESIN & PARAMETER
             if 'G' in params:
                 g_val = int(params['G'])
                 if g_val == 20: unit_scale = 25.4
@@ -157,159 +131,97 @@ class GCodeAuditorUltimate:
 
             if 'M' in params:
                 m_val = int(params['M'])
-                if m_val in (3, 4): laser_spindle_on = True # M3 / M4 Dynamic Laser Mode
+                if m_val in (3, 4): laser_spindle_on = True
                 elif m_val == 5: laser_spindle_on = False
 
-            if 'F' in params: feedrate = params['F']
-            if 'S' in params: spindle_power = params['S']
             if 'Z' in params: cz = params['Z'] * unit_scale
 
-            # 2. KALKULASI KOORDINAT TARGET
-            has_xy_motion = ('X' in params or 'Y' in params)
-            
-            if has_xy_motion:
-                if 'X' in params:
-                    val_x = params['X'] * unit_scale
-                    tx = (cx + val_x) if is_relative else val_x
-                else:
-                    tx = cx
+            has_xy = ('X' in params or 'Y' in params)
+            if not has_xy: continue
 
-                if 'Y' in params:
-                    val_y = params['Y'] * unit_scale
-                    ty = (cy + val_y) if is_relative else val_y
-                else:
-                    ty = cy
-            else:
-                # Tidak ada pergerakan X/Y pada baris ini
-                continue
+            tx = (cx + params['X']*unit_scale) if ('X' in params and is_relative) else params.get('X', cx)*unit_scale
+            ty = (cy + params['Y']*unit_scale) if ('Y' in params and is_relative) else params.get('Y', cy)*unit_scale
 
-            # Hitung jarak pergerakan saat ini
             step_dist = math.sqrt((tx - cx)**2 + (ty - cy)**2)
-
-            # 3. KLASIFIKASI MODE (CUTTING VS TRAVEL)
-            # Cutting jika Mode G1/G2/G3 DAN (Laser/Spindle Aktif atau Z <= 0)
             is_cut_code = (active_g_mode in (1, 2, 3))
             is_cutting_active = is_cut_code and (laser_spindle_on or cz <= 0)
             
             mode = "CUTTING" if is_cutting_active else "TRAVEL"
             
-            # --- AKUMULASI TOTAL JARAK ---
-            if mode == "CUTTING":
-                total_cut_dist += step_dist
-            else:
-                total_rapid_dist += step_dist
+            if mode == "CUTTING": total_cut_dist += step_dist
+            else: total_rapid_dist += step_dist
             
-            # --- LOGIKA AREA & SEGMENTATION ---
             if mode == "CUTTING":
-                # Tutup log Travel jika sebelumnya sedang Travel
                 if is_traveling:
-                    msg = (f"[TRAVEL] Dist: {travel_accumulated_dist:.2f} mm\n"
-                           f"   From: ({travel_start_pos[0]:.1f}, {travel_start_pos[1]:.1f}) -> To: ({cx:.1f}, {cy:.1f})\n")
-                    self.terminal.insert(tk.END, msg, "travel")
+                    msg = f"[TRAVEL] Dist: {travel_accumulated_dist:.2f} mm\n   From: ({travel_start_pos[0]:.1f}, {travel_start_pos[1]:.1f}) -> To: ({cx:.1f}, {cy:.1f})"
+                    self.terminal.append(msg)
                     is_traveling = False
                     travel_accumulated_dist = 0.0
                 
-                # Inisialisasi Buffer Area Baru
                 if not is_collecting_area:
                     is_collecting_area = True
                     current_poly_points = [(cx, cy)]
                     current_block_xs = [cx]; current_block_ys = [cy]
                 
-                points_to_add = []
-                if active_g_mode == 1:
-                    points_to_add = [(tx, ty)]
-                elif active_g_mode in (2, 3):
-                    points_to_add = self.generate_arc_points((cx, cy), (tx, ty), params, is_ccw=(active_g_mode == 3), scale=unit_scale)
-                
+                points_to_add = [(tx, ty)] if active_g_mode == 1 else self.generate_arc_points((cx, cy), (tx, ty), params, is_ccw=(active_g_mode == 3), scale=unit_scale)
                 current_poly_points.extend(points_to_add)
                 for px, py in points_to_add:
                     current_block_xs.append(px); current_block_ys.append(py)
 
+                path_cutting.moveTo(cx, cy)
+                for px, py in points_to_add:
+                    path_cutting.lineTo(px, py)
+
             elif mode == "TRAVEL":
-                # Tutup log Cutting dan Hitung Luas Area Objek
                 if is_collecting_area:
                     object_counter += 1
                     area = self.calculate_polygon_area(current_poly_points)
-                    
-                    # Bounding Box
-                    if current_block_xs:
+                    if current_block_xs and current_block_ys:
                         min_x = min(current_block_xs); max_x = max(current_block_xs)
                         min_y = min(current_block_ys); max_y = max(current_block_ys)
-                        rect = patches.Rectangle((min_x, min_y), max_x-min_x, max_y-min_y, lw=0.8, ec='blue', fill=False, ls=':', alpha=0.7)
-                        self.ax.add_patch(rect)
-                        self.ax.text(min_x, min_y, str(object_counter), color='blue', fontsize=9, fontweight='bold', va='top', ha='right')
+                        
+                        # 1. Bounding Box (Rect)
+                        self.canvas.scene.addRect(
+                            min_x, min_y, max_x - min_x, max_y - min_y, 
+                            QPen(QColor("blue"), 0, Qt.DotLine)
+                        )
+                        
+                        # 2. Hitung Titik Tengah Objek (Center)
+                        center_x = (min_x + max_x) / 2.0
+                        center_y = (min_y + max_y) / 2.0
+                        
+                        # 3. Buat Text Item
+                        text_item = self.canvas.scene.addText(str(object_counter))
+                        text_item.setDefaultTextColor(QColor("blue"))
+                        text_item.setFont(QFont("Consolas", 8, QFont.Bold))
+                        
+                        # Set Flag Abaikan Zoom
+                        text_item.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+                        
+                        # Posisikan langsung di koordinat (center_x, center_y)
+                        # Tanpa offset height yang bikin ketarik Y-negatif
+                        text_item.setPos(center_x, center_y)
 
-                    msg = f"[OBJECT #{object_counter}] Area: {area:.2f} mm²\n"
-                    self.terminal.insert(tk.END, msg, "cut")
-                    self.terminal.insert(tk.END, "-"*45 + "\n")
-                    
+                    self.terminal.append(f"[OBJECT #{object_counter}] Area: {area:.2f} mm²\n" + "-"*35)
                     is_collecting_area = False
-                    current_poly_points = []
-                    current_block_xs = []; current_block_ys = []
-                
-                if not is_traveling:
-                    is_traveling = True
-                    travel_start_pos = (cx, cy)
-                    travel_accumulated_dist = 0.0
-                
-                travel_accumulated_dist += step_dist
+                    current_poly_points = []; current_block_xs = []; current_block_ys = []
 
-            # VISUALISASI
-            color = 'black' if mode == "CUTTING" else 'red'
-            style = '-' if mode == "CUTTING" else '--'
-            width = 1.5 if mode == "CUTTING" else 0.8
-            self.ax.plot([cx, tx], [cy, ty], color=color, linestyle=style, linewidth=width)
-            
             cx, cy = tx, ty
 
-        # Handle End-Of-File (EOF)
-        if is_collecting_area and len(current_poly_points) > 2:
-            object_counter += 1
-            area = self.calculate_polygon_area(current_poly_points)
-            if current_block_xs:
-                 min_x = min(current_block_xs); min_y = min(current_block_ys)
-                 rect = patches.Rectangle((min_x, min_y), max(current_block_xs)-min_x, max(current_block_ys)-min_y, lw=0.8, ec='blue', fill=False, ls=':')
-                 self.ax.add_patch(rect)
-                 self.ax.text(min_x, min_y, str(object_counter), color='blue', fontsize=9, fontweight='bold', va='top', ha='right')
-            msg = f"[OBJECT #{object_counter}] Area: {area:.2f} mm² (EOF)\n"
-            self.terminal.insert(tk.END, msg, "cut")
+        self.canvas.scene.addPath(path_cutting, pen_g1)
+        self.canvas.scene.addPath(path_travel, pen_g0)
 
-        if is_traveling and travel_accumulated_dist > 0:
-            msg = f"[TRAVEL] Dist: {travel_accumulated_dist:.2f} mm (EOF)\n"
-            self.terminal.insert(tk.END, msg, "travel")
+        if not self.canvas.scene.itemsBoundingRect().isEmpty():
+            self.canvas.fitInView(self.canvas.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
 
-        # --- SUMMARY FINAL ---
         grand_total = total_rapid_dist + total_cut_dist
-        
-        summary_text = (
-            f"FINAL AUDIT REPORT:\n"
-            f"1. Total Objects Found : {object_counter}\n"
-            f"2. Rapid Travel (Red)  : {total_rapid_dist:.2f} mm\n"
-            f"3. Cutting Path (Black): {total_cut_dist:.2f} mm\n"
-            f"---------------------------------------------\n"
-            f"4. TOTAL JOB DISTANCE  : {grand_total:.2f} mm"
+        summary = (
+            f"\nFINAL INSPECTION REPORT:\n"
+            f"1. Total Objects     : {object_counter}\n"
+            f"2. Rapid Travel (Red): {total_rapid_dist:.2f} mm\n"
+            f"3. Cutting (Black)   : {total_cut_dist:.2f} mm\n"
+            f"------------------------------------\n"
+            f"TOTAL DISTANCE       : {grand_total:.2f} mm"
         )
-        
-        self.terminal.insert(tk.END, "\n" + "="*45 + "\n", "header")
-        self.terminal.insert(tk.END, summary_text + "\n", "total")
-        self.terminal.insert(tk.END, "="*45 + "\n", "header")
-        self.terminal.see(tk.END)
-        
-        # Header Info
-        self.lbl_info.config(text=f"Total Dist: {grand_total:.2f} mm (Rapid: {total_rapid_dist:.1f} + Cut: {total_cut_dist:.1f})")
-
-        # Legend Plotting
-        from matplotlib.lines import Line2D
-        legend_elements = [
-            Line2D([0],[0], color='black', lw=1.5, label='Cutting'),
-            Line2D([0],[0], color='red', lw=0.8, linestyle='--', label='Rapid Travel'),
-            patches.Rectangle((0,0),1,1, edgecolor='blue', facecolor='none', linestyle=':', label='Obj ID')
-        ]
-        self.ax.legend(handles=legend_elements, loc='upper right', fontsize='small')
-        self.ax.plot(0, 0, 'go')
-        self.canvas.draw()
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = GCodeAuditorUltimate(root)
-    root.mainloop()
+        self.terminal.append(summary)
+        self.lbl_info.setText(f"Total: {grand_total:.2f} mm (Cut: {total_cut_dist:.1f} | Rapid: {total_rapid_dist:.1f})")
